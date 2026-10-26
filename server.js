@@ -89,6 +89,82 @@ function lastUserText(messages) {
   return "";
 }
 
+// ---------------------------------------------------------------------------
+// Multimodal: OpenAI content parts -> ACP prompt content blocks.
+// `image_url` parts become {type:"image", data, mimeType} (data: URLs decode
+// directly; http(s) URLs are fetched shim-side, 15s/20MB caps). `file` parts
+// with text/* data decode inline as text. Anything else is dropped.
+// ---------------------------------------------------------------------------
+
+async function resolveImageUrl(url) {
+  const m = /^data:([^;,]+);base64,(.+)$/s.exec(url);
+  if (m) return { data: m[2], mimeType: m[1] };
+  const r = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+  if (!r.ok) throw new Error(`image fetch failed: HTTP ${r.status}`);
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (buf.length > 20 * 1024 * 1024) throw new Error("image exceeds 20MB");
+  return { data: buf.toString("base64"), mimeType: (r.headers.get("content-type") ?? "image/png").split(";")[0] };
+}
+
+async function messageToBlocks(m) {
+  const prefix = { system: "SYSTEM", user: "USER", assistant: "ASSISTANT", tool: "TOOL" }[m.role] ?? m.role.toUpperCase();
+  const calls = m.role === "assistant" && m.tool_calls?.length
+    ? ` [tool_calls: ${m.tool_calls.map((t) => `${t.function.name}(${t.function.arguments})`).join(", ")}]`
+    : "";
+  if (typeof m.content === "string" || m.content == null) {
+    return [{ type: "text", text: `${prefix}: ${m.content ?? ""}${calls}` }];
+  }
+  const blocks = [];
+  let first = true;
+  const head = () => (first ? `${prefix}: ` : "");
+  for (const p of m.content) {
+    if (p.type === "text" && p.text) {
+      blocks.push({ type: "text", text: `${head()}${p.text}${calls}` });
+      first = false;
+    } else if (p.type === "image_url" && p.image_url?.url) {
+      const img = await resolveImageUrl(p.image_url.url);
+      if (first) { blocks.push({ type: "text", text: `${prefix}:${calls}` }); first = false; }
+      blocks.push({ type: "image", data: img.data, mimeType: img.mimeType });
+    } else if (p.type === "file" && p.file?.file_data) {
+      const dm = /^data:([^;,]+);base64,(.+)$/s.exec(p.file.file_data);
+      const txt = dm ? Buffer.from(dm[2], "base64").toString("utf8") : null;
+      if (txt) {
+        blocks.push({ type: "text", text: `${head()}[file ${p.file.filename ?? "attachment"}]:\n${txt}` });
+        first = false;
+      }
+    }
+  }
+  if (!blocks.length) blocks.push({ type: "text", text: `${prefix}:${calls}` });
+  return blocks;
+}
+
+async function messagesToBlocks(messages) {
+  const out = [];
+  for (const m of messages) out.push(...await messageToBlocks(m));
+  return out;
+}
+
+async function lastUserBlocks(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") return messageToBlocks(messages[i]);
+  }
+  return null;
+}
+
+// ACP prompt result usage -> OpenAI chat usage. Fields pass through with
+// real counts (incl. cached) when the transport reports them.
+function realUsage(u, estPrompt, estCompletion) {
+  if (!u) {
+    return { prompt_tokens: estPrompt, completion_tokens: estCompletion, total_tokens: estPrompt + estCompletion, estimated: true };
+  }
+  return {
+    prompt_tokens: u.inputTokens,
+    completion_tokens: u.outputTokens,
+    total_tokens: u.totalTokens,
+    ...(u.cachedReadTokens ? { prompt_tokens_details: { cached_tokens: u.cachedReadTokens } } : {}),
+  };
+}
+
 // Emulated function calling: describe tools in the prompt, ask for a JSON
 // tool_call object, map it back to OpenAI shape.
 function toolsPreamble(tools, toolChoice) {
@@ -280,13 +356,12 @@ class AcpClient {
     return res.sessionId;
   }
 
-  async prompt(sessionId, text, onChunk) {
+  // Prompt with ACP content blocks [{type:"text"|"image",...}]. Resolves to the
+  // raw result (includes real token usage); invokes onChunk per text delta.
+  async prompt(sessionId, blocks, onChunk) {
     if (onChunk) this.chunkHandlers.set(sessionId, onChunk);
     try {
-      return await this.request("session/prompt", {
-        sessionId,
-        prompt: [{ type: "text", text }],
-      });
+      return await this.request("session/prompt", { sessionId, prompt: blocks });
     } finally {
       this.chunkHandlers.delete(sessionId);
     }
@@ -321,20 +396,20 @@ async function acpChat(convKey, messages, onChunk) {
     if (!s.sessionId) s.sessionId = await acp.newSession();
     // ACP sessions keep context — send only the new user turn if the session
     // already has history, else the flattened transcript.
-    const text = s.hasHistory ? (lastUserText(messages) || flattenMessages(messages)) : flattenMessages(messages);
+    const blocks = s.hasHistory ? (await lastUserBlocks(messages) ?? await messagesToBlocks(messages)) : await messagesToBlocks(messages);
     let acc = "";
     try {
-      await acp.prompt(s.sessionId, text, (t) => { acc += t; onChunk?.(t); });
+      const r = await acp.prompt(s.sessionId, blocks, (t) => { acc += t; onChunk?.(t); });
       s.hasHistory = true;
-      return acc;
+      return { text: acc, usage: r?.usage ?? null };
     } catch (e) {
       // Session may have died with a restarted acp process — recreate once.
       s.sessionId = await acp.newSession();
       s.hasHistory = false;
       acc = "";
-      await acp.prompt(s.sessionId, flattenMessages(messages), (t) => { acc += t; onChunk?.(t); });
+      const r = await acp.prompt(s.sessionId, await messagesToBlocks(messages), (t) => { acc += t; onChunk?.(t); });
       s.hasHistory = true;
-      return acc;
+      return { text: acc, usage: r?.usage ?? null };
     }
   });
   s.busy = job;
@@ -410,7 +485,9 @@ async function generateOne(body, onChunk, convKeyOverride) {
   if (body.response_format?.type === "json_object") {
     msgs.unshift({ role: "system", content: "Respond with a single valid JSON object only. No prose, no markdown fences." });
   }
-  return TRANSPORT === "acp" ? acpChat(convKey, msgs, onChunk) : runDevinPrint(flattenMessages(msgs));
+  return TRANSPORT === "acp"
+    ? acpChat(convKey, msgs, onChunk)
+    : runDevinPrint(flattenMessages(msgs)).then((text) => ({ text, usage: null }));
 }
 
 app.post("/v1/chat/completions", async (req, res) => {
@@ -443,17 +520,15 @@ app.post("/v1/chat/completions", async (req, res) => {
       // SSE comment pings keep the connection alive across proxies while the
       // agent is silent (acp first-token latency can be many seconds).
       heartbeat = setInterval(() => res.write(": hb\n\n"), 15000);
-      const text = await generateOne(body, (t) => send({ content: t }));
+      const { text, usage } = await generateOne(body, (t) => send({ content: t }));
       clearInterval(heartbeat);
       const choice = buildChoice(text, body);
       if (choice.message.tool_calls) send({ tool_calls: choice.message.tool_calls });
       send({}, choice.finish_reason);
       if (body.stream_options?.include_usage) {
-        const pt = estimateTokens(JSON.stringify(body.messages));
-        const ct = estimateTokens(text);
         res.write(`data: ${JSON.stringify({
           id, object: "chat.completion.chunk", created, model: DEVIN_MODEL,
-          choices: [], usage: { prompt_tokens: pt, completion_tokens: ct, total_tokens: pt + ct },
+          choices: [], usage: realUsage(usage, estimateTokens(JSON.stringify(body.messages)), estimateTokens(text)),
         })}\n\n`);
       }
       res.write("data: [DONE]\n\n");
@@ -461,12 +536,15 @@ app.post("/v1/chat/completions", async (req, res) => {
     }
 
     const baseKey = body.user ?? body.__sessionHeader ?? crypto.randomUUID();
-    const texts = await Promise.all(
+    const results = await Promise.all(
       // n>1: each choice needs an independent session, not the shared convo
       Array.from({ length: n }, (_, i) => generateOne(body, undefined, `${baseKey}#${i}`)),
     );
-    const promptTokens = estimateTokens(JSON.stringify(body.messages));
-    const choices = texts.map((t, i) => buildChoice(t, body, i));
+    const estPrompt = estimateTokens(JSON.stringify(body.messages));
+    const choices = results.map((r, i) => buildChoice(r.text, body, i));
+    const promptToks = results.reduce((a, r) => a + (r.usage?.inputTokens ?? estPrompt), 0);
+    const completionToks = results.reduce((a, r) => a + (r.usage?.outputTokens ?? estimateTokens(r.text)), 0);
+    const cachedToks = results.reduce((a, r) => a + (r.usage?.cachedReadTokens ?? 0), 0);
     res.json({
       id: `chatcmpl-${crypto.randomBytes(12).toString("hex")}`,
       object: "chat.completion",
@@ -474,9 +552,11 @@ app.post("/v1/chat/completions", async (req, res) => {
       model: DEVIN_MODEL,
       choices: choices.map(({ _promptText, ...c }) => c),
       usage: {
-        prompt_tokens: promptTokens,
-        completion_tokens: texts.reduce((a, t) => a + estimateTokens(t), 0),
-        get total_tokens() { return this.prompt_tokens + this.completion_tokens; },
+        prompt_tokens: promptToks,
+        completion_tokens: completionToks,
+        total_tokens: promptToks + completionToks,
+        ...(cachedToks ? { prompt_tokens_details: { cached_tokens: cachedToks } } : {}),
+        ...(results.every((r) => !r.usage) ? { estimated: true } : {}),
       },
     });
   } catch (e) {
@@ -505,7 +585,13 @@ function responsesInputToMessages(input) {
     }
     if (it.type === "message") {
       const parts = Array.isArray(it.content) ? it.content : [{ text: String(it.content) }];
-      msgs.push({ role: it.role ?? "user", content: parts.map((p) => p.text ?? "").join("\n") });
+      // Map Responses input parts onto chat content parts so images/files flow.
+      const content = parts.map((p) => {
+        if (p.type === "input_image" && p.image_url) return { type: "image_url", image_url: { url: p.image_url } };
+        if (p.type === "input_file" && p.file_data) return { type: "file", file: { file_data: p.file_data, filename: p.filename } };
+        return { type: "text", text: p.text ?? "" };
+      });
+      msgs.push({ role: it.role ?? "user", content });
     } else if (it.type === "function_call") {
       msgs.push({ role: "assistant", content: "", tool_calls: [{ id: it.call_id, type: "function", function: { name: it.name, arguments: it.arguments } }] });
     } else if (it.type === "function_call_output") {
@@ -518,18 +604,22 @@ function responsesInputToMessages(input) {
 
 const rid = (p) => `${p}_${crypto.randomBytes(12).toString("hex")}`;
 
-function buildResponse(id, text, body, status = "completed") {
+function buildResponse(id, text, body, usage, status = "completed") {
   const toolCall = body.tools?.length ? parseToolCall(text, body.tools) : null;
   const clean = toolCall ? "" : applyPostHoc(text, body);
   const output = toolCall
     ? [{ type: "function_call", id: rid("fc"), call_id: toolCall.id, name: toolCall.function.name, arguments: toolCall.function.arguments, status: "completed" }]
     : [{ id: rid("msg"), type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: clean, annotations: [] }] }];
-  const it = estimateTokens(JSON.stringify(body.messages));
-  const ot = estimateTokens(toolCall ? toolCall.function.arguments : clean);
+  const it = usage?.inputTokens ?? estimateTokens(JSON.stringify(body.messages));
+  const ot = usage?.outputTokens ?? estimateTokens(toolCall ? toolCall.function.arguments : clean);
   return {
     id, object: "response", created_at: Math.floor(Date.now() / 1000), status,
     model: DEVIN_MODEL, output, output_text: clean,
-    usage: { input_tokens: it, output_tokens: ot, total_tokens: it + ot },
+    usage: {
+      input_tokens: it, output_tokens: ot, total_tokens: usage?.totalTokens ?? it + ot,
+      ...(usage?.cachedReadTokens ? { input_tokens_details: { cached_tokens: usage.cachedReadTokens } } : {}),
+      ...(!usage ? { estimated: true } : {}),
+    },
     store: body.store ?? true, metadata: body.metadata ?? {},
     previous_response_id: body.previous_response_id ?? null,
   };
@@ -582,15 +672,15 @@ app.post("/v1/responses", async (req, res) => {
       const msgId = rid("msg"), part = { type: "output_text", text: "", annotations: [] };
       const item = { id: msgId, type: "message", status: "in_progress", role: "assistant", content: [] };
 
-      ev("response.created", { response: { ...buildResponse(respId, "", normBody, "in_progress"), output: [] } });
+      ev("response.created", { response: { ...buildResponse(respId, "", normBody, null, "in_progress"), output: [] } });
       ev("response.in_progress", { response: { id: respId, status: "in_progress" } });
       ev("response.output_item.added", { output_index: 0, item });
       ev("response.content_part.added", { item_id: msgId, output_index: 0, content_index: 0, part });
       heartbeat = setInterval(() => res.write(": hb\n\n"), 15000);
-      const text = await generateOne(normBody, (t) => ev("response.output_text.delta", { item_id: msgId, output_index: 0, content_index: 0, delta: t }), convKey);
+      const { text, usage } = await generateOne(normBody, (t) => ev("response.output_text.delta", { item_id: msgId, output_index: 0, content_index: 0, delta: t }), convKey);
       clearInterval(heartbeat);
 
-      const final = buildResponse(respId, text, normBody);
+      const final = buildResponse(respId, text, normBody, usage);
       if (final.output[0].type === "function_call") {
         const fc = final.output[0];
         ev("response.output_item.added", { output_index: 0, item: { ...fc, status: "in_progress" } });
@@ -606,8 +696,8 @@ app.post("/v1/responses", async (req, res) => {
       return res.end();
     }
 
-    const text = await generateOne(normBody, undefined, convKey);
-    const final = buildResponse(respId, text, normBody);
+    const { text, usage } = await generateOne(normBody, undefined, convKey);
+    const final = buildResponse(respId, text, normBody, usage);
     respStore.set(respId, convKey);
     res.json(final);
   } catch (e) {

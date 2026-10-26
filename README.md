@@ -110,19 +110,21 @@ currently served (`served: true`). Each entry carries `free`,
 |-------|----------|
 | `model` | ✅ validated — must equal `DEVIN_MODEL`, else `404 model_not_found` |
 | `messages` | ✅ full roles incl. `tool` results |
+| `content[]` `image_url` | ✅ data: URLs + http(s) fetch (acp); → ACP `image` blocks |
+| `content[]` `file` / `input_file` | ✅ text/* base64 inlined (acp) |
 | `stream` | ✅ real deltas (acp) / single chunk (print) |
 | `n` | ✅ up to 4, each on an independent session |
 | `user` / `x-session-id` | ✅ conversation key → persistent session (multi-turn) |
 | `stop` | ✅ truncation on first match |
 | `max_tokens` / `max_completion_tokens` | ⚠️ post-hoc truncation (~4 chars/token) |
-| `stream_options.include_usage` | ✅ emits usage chunk before `[DONE]` (estimated counts) |
+| `stream_options.include_usage` | ✅ emits usage chunk before `[DONE]` |
 | `response_format: json_object` | ✅ prompt-enforced + JSON-only reply |
 | `tools` / `tool_choice` | ⚠️ **emulated** — described in prompt, model replies `{"tool_call":{...}}` → mapped to OpenAI `tool_calls`; object form `{"type":"function",...}` forces that function |
 | `functions` / `function_call` (legacy) | ✅ normalized to `tools` / `tool_choice` |
 | CORS | ✅ `Access-Control-Allow-Origin: *` + `OPTIONS` preflight |
 | SSE heartbeat | ✅ `: hb` comment every 15 s during generation |
 | `temperature`, `top_p`, penalties, `seed`, `logprobs` | ❌ accepted, ignored — the CLI exposes no sampling controls |
-| `usage` | ⚠️ estimated (~chars/4); the CLI doesn't report tokens |
+| `usage` | ✅ **real counts** incl. `prompt_tokens_details.cached_tokens` (acp); `estimated: true` flag on print fallback |
 
 ## Example
 
@@ -174,13 +176,19 @@ internally — the shim's lever is *how much gets sent per turn*:
 - **Tunables pass through to the CLI env**: `DEVIN_COMPACTION_THRESHOLDS`,
   `SIDEKICK_COMPACTION_THRESHOLDS`, `DEVIN_REFUSAL_FALLBACK`, `DEVIN_MODEL`.
   Lower compaction thresholds = earlier summarization = cheaper long turns.
-- `usage` fields are estimates (~4 chars/token) — the CLI reports real
-  counts internally but doesn't expose them over ACP.
+- **`usage` is real on `acp`** — `session/prompt` returns
+  `inputTokens`/`outputTokens`/`totalTokens`/`cachedReadTokens`; they're
+  surfaced verbatim (cached tokens under `prompt_tokens_details.cached_tokens`
+  / `input_tokens_details.cached_tokens`). The `print` transport can't measure
+  them and emits `estimated: true` (~4 chars/token).
 
 ## Limitations
 
 - No sampling controls exist on the backend — `temperature` etc. are no-ops.
-- `usage` token counts are estimates.
+- Images are model-bound: the ACP transport accepts `image` prompt blocks
+  (`promptCapabilities.image: true`), but whether the selected model actually
+  *sees* them depends on the backend — `audio` is not supported at all.
+  `file` parts decode inline only for text/* data.
 - Function calling is prompt-emulated: good for simple clients, not
   guaranteed-format like OpenAI's constrained decoding.
 - Confirm the exact model ID with `devin models list --format json` after login.

@@ -30,10 +30,20 @@ normalize to `tools`/`tool_choice` in both endpoints.
   do not weaken either layer.
 - Emulations to know before debugging: `tools` are prompt-injected and parsed
   from a `{"tool_call":{...}}` reply; `stop`/`max_tokens` truncate post-hoc;
-  `usage` is estimated (~4 chars/token); sampling params are no-ops.
+  `usage` is **real** on `acp` — `session/prompt` returns
+  `inputTokens`/`outputTokens`/`totalTokens`/`cachedReadTokens` (surfaced
+  incl. `prompt_tokens_details.cached_tokens`); `print` falls back to
+  estimates flagged `estimated: true`. Sampling params are no-ops.
 - Request `model` is validated: must equal `DEVIN_MODEL` or the shim returns
   `404 model_not_found`. (The ACP process is spawned with `--model` once, so
   per-request model switching isn't possible — no passthrough.)
+- Multimodal input (acp only): `image_url` content parts → ACP `image` blocks
+  (data: URLs decode directly; http(s) fetched shim-side, 15 s / 20 MB caps);
+  `file` parts with text/* base64 inline as text. ACP `initialize` reports
+  `promptCapabilities.image: true`, `audio: false` — whether the model
+  *sees* images is backend-model dependent (SWE-2 accepts them; quality
+  varies). Image delivery depends on the readonly `read` tool: the CLI saves
+  pasted images to temp files and the agent reads them — do not deny `read`.
 
 ## Run / test
 
