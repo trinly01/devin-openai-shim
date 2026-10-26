@@ -96,7 +96,10 @@ function toolsPreamble(tools, toolChoice) {
     .filter((t) => t.type === "function")
     .map((t) => JSON.stringify(t.function))
     .join("\n");
-  const mode = toolChoice === "required" ? "must" : toolChoice === "none" ? "must NOT" : "may, if needed,";
+  const forced = typeof toolChoice === "object" ? toolChoice?.function?.name : null;
+  const mode = forced
+    ? `must call the function "${forced}" and only it. You`
+    : toolChoice === "required" ? "must" : toolChoice === "none" ? "must NOT" : "may, if needed,";
   return [
     `You ${mode} call a function. Available functions:`,
     specs,
@@ -116,6 +119,7 @@ function parseToolCall(text, tools) {
     return {
       id: `call_${crypto.randomBytes(12).toString("hex")}`,
       type: "function",
+      index: 0, // required by strict OpenAI clients in streamed deltas
       function: {
         name: valid ? tool_call.name : tool_call.name, // pass through; hallucinated names still surface
         arguments: typeof tool_call.arguments === "string" ? tool_call.arguments : JSON.stringify(tool_call.arguments ?? {}),
@@ -126,7 +130,8 @@ function parseToolCall(text, tools) {
   }
 }
 
-function applyPostHoc(text, { stop, max_tokens }) {
+function applyPostHoc(text, { stop, max_tokens, max_completion_tokens }) {
+  const cap = max_tokens ?? max_completion_tokens;
   let out = text;
   for (const s of [].concat(stop ?? [])) {
     if (s) {
@@ -134,9 +139,9 @@ function applyPostHoc(text, { stop, max_tokens }) {
       if (i !== -1) out = out.slice(0, i);
     }
   }
-  if (max_tokens) {
+  if (cap) {
     // rough token cap: ~4 chars/token
-    out = out.slice(0, max_tokens * 4);
+    out = out.slice(0, cap * 4);
   }
   return out;
 }
@@ -343,10 +348,20 @@ async function acpChat(convKey, messages, onChunk) {
 const app = express();
 app.use(express.json({ limit: "4mb" }));
 
+// Permissive CORS: the shim binds to localhost anyway; this unblocks
+// browser-based OpenAI clients.
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, x-session-id");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 app.use((req, res, next) => {
   if (!API_KEY || req.path === "/v1/catalog") return next(); // catalog is public
   const token = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
-  if (token !== API_KEY) {
+  if (token.length !== API_KEY.length || !crypto.timingSafeEqual(Buffer.from(token), Buffer.from(API_KEY))) {
     return res.status(401).json({ error: { message: "invalid api key", type: "invalid_request_error" } });
   }
   next();
@@ -368,7 +383,7 @@ function buildChoice(text, body, index = 0) {
       content: toolCall ? null : clean,
       ...(toolCall ? { tool_calls: [toolCall] } : {}),
     },
-    finish_reason: toolCall ? "tool_calls" : body.max_tokens && clean.length >= body.max_tokens * 4 ? "length" : "stop",
+    finish_reason: toolCall ? "tool_calls" : (body.max_tokens ?? body.max_completion_tokens) && clean.length >= (body.max_tokens ?? body.max_completion_tokens) * 4 ? "length" : "stop",
     _promptText: text,
   };
 }
@@ -396,6 +411,7 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
   const n = Math.min(Math.max(body.n ?? 1, 1), 4); // cap: each choice = one agent run
 
+  let heartbeat = null;
   try {
     if (body.stream) {
       res.setHeader("Content-Type", "text/event-stream");
@@ -410,14 +426,22 @@ app.post("/v1/chat/completions", async (req, res) => {
         })}\n\n`);
 
       send({ role: "assistant" });
-      let first = true;
-      const text = await generateOne(body, (t) => {
-        if (first) { send({ content: t }); first = false; }
-        else send({ content: t });
-      });
+      // SSE comment pings keep the connection alive across proxies while the
+      // agent is silent (acp first-token latency can be many seconds).
+      heartbeat = setInterval(() => res.write(": hb\n\n"), 15000);
+      const text = await generateOne(body, (t) => send({ content: t }));
+      clearInterval(heartbeat);
       const choice = buildChoice(text, body);
       if (choice.message.tool_calls) send({ tool_calls: choice.message.tool_calls });
       send({}, choice.finish_reason);
+      if (body.stream_options?.include_usage) {
+        const pt = estimateTokens(JSON.stringify(body.messages));
+        const ct = estimateTokens(text);
+        res.write(`data: ${JSON.stringify({
+          id, object: "chat.completion.chunk", created, model: DEVIN_MODEL,
+          choices: [], usage: { prompt_tokens: pt, completion_tokens: ct, total_tokens: pt + ct },
+        })}\n\n`);
+      }
       res.write("data: [DONE]\n\n");
       return res.end();
     }
@@ -442,6 +466,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       },
     });
   } catch (e) {
+    if (heartbeat) clearInterval(heartbeat);
     if (res.headersSent) return res.end();
     openaiError(res, 502, e.message, "upstream_error");
   }

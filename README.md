@@ -94,9 +94,12 @@ currently served (`served: true`). Each entry carries `free`,
 | `n` | ✅ up to 4, each on an independent session |
 | `user` / `x-session-id` | ✅ conversation key → persistent session (multi-turn) |
 | `stop` | ✅ truncation on first match |
-| `max_tokens` | ⚠️ post-hoc truncation (~4 chars/token) |
+| `max_tokens` / `max_completion_tokens` | ⚠️ post-hoc truncation (~4 chars/token) |
+| `stream_options.include_usage` | ✅ emits usage chunk before `[DONE]` (estimated counts) |
 | `response_format: json_object` | ✅ prompt-enforced + JSON-only reply |
-| `tools` / `tool_choice` | ⚠️ **emulated** — described in prompt, model replies `{"tool_call":{...}}` → mapped to OpenAI `tool_calls` |
+| `tools` / `tool_choice` | ⚠️ **emulated** — described in prompt, model replies `{"tool_call":{...}}` → mapped to OpenAI `tool_calls`; object form `{"type":"function",...}` forces that function |
+| CORS | ✅ `Access-Control-Allow-Origin: *` + `OPTIONS` preflight |
+| SSE heartbeat | ✅ `: hb` comment every 15 s during generation |
 | `temperature`, `top_p`, penalties, `seed`, `logprobs` | ❌ accepted, ignored — the CLI exposes no sampling controls |
 | `usage` | ⚠️ estimated (~chars/4); the CLI doesn't report tokens |
 
