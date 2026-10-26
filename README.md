@@ -19,6 +19,11 @@ devin auth login   # one-time, browser flow — verify with `devin auth status`
 > Devin session, so it's typically one click, but it must be run once per
 > machine. The token does not expire by default.
 
+If a request ever hits `Not logged in` anyway, the shim launches
+`devin auth login` in a new console window on your desktop (Windows only,
+debounced to one window per 60 s) — the browser flow needs a real TTY, so
+it can't be driven headlessly. Disable with `DEVIN_AUTO_LOGIN=0`.
+
 If `devin` isn't on PATH on Windows, use the bundled binary:
 
 ```bash
@@ -180,6 +185,7 @@ and `/v1/images/serve/*` (unguessable IDs for generated images).
 | `ACP_MODE` | `smart` | Agent persona. `smart` exposes tools incl. MCP; `ask` = Q&A-only (no tools); `accept-edits`/`plan`/`bypass` = coding modes |
 | `ACP_CWD` | `%TEMP%/devin-shim-workspace` | Workspace root given to sessions. Neutral default so the agent doesn't greet "in &lt;repo&gt;" |
 | `SHIM_CONFIG` | `safe` | Permission profile: `safe` = local read-only + remote tools allowed (MCP, web_search, fetch/browse); `readonly` = denies those too |
+| `DEVIN_AUTO_LOGIN` | `1` | On `Not logged in`, pop a console window running `devin auth login` (Windows only; debounced 60 s). `0` = plain errors |
 
 ## Token & cost optimization
 
