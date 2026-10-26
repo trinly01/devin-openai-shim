@@ -165,7 +165,7 @@ unless `SHIM_API_KEY` is set — when set it guards **all** routes, including
 | `DEVIN_MODEL` | `swe-2-high` | Model passed to `devin --model` |
 | `TRANSPORT` | `acp` | `acp` (persistent, streaming) or `print` (spawn per call) |
 | `PORT` / `HOST` | `8787` / `127.0.0.1` | Bind address (keep localhost) |
-| `SHIM_API_KEY` | unset (open) | If set, required as `Authorization: Bearer` |
+| `SHIM_API_KEY` | unset (open) | If set, required as `Authorization: Bearer`. Multi-key: comma-separated `name:key` pairs (or bare keys — labeled by prefix). Per-key usage at `GET /v1/access`; one `[access]` line per request, denials logged |
 | `MAX_CONCURRENT` | `2` | Parallel agent runs (print transport); excess requests queue |
 | `DEVIN_TIMEOUT_MS` | `480000` | Per-request timeout |
 | `SESSION_TTL_MS` | `1800000` | Idle conversation eviction |

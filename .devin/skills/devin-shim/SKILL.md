@@ -60,7 +60,11 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 ```
 
 When `SHIM_API_KEY` is set it guards **every** route including `/health` —
-requests without `Authorization: Bearer` get 401.
+requests without `Authorization: Bearer` get 401. Multi-key format:
+`name:key,name2:key2` (bare keys get auto-labels). Names identify callers in
+the single-line `[access]` log (timestamp, key label, route, IP, `user`/
+`x-session-id`) and `GET /v1/access` (per-key request count + last-seen).
+Denials are logged too; `/health` and image-serve routes skip logging.
 
 Requires `devin auth login` to have been run once — browser flow, the user
 must do it (it reuses their existing Devin browser session; typically one

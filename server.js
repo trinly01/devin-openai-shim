@@ -20,7 +20,16 @@ const READONLY_CONFIG = path.join(__dirname, "devin-readonly.json");
 const TRANSPORT = process.env.TRANSPORT ?? "acp"; // "acp" | "print"
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? "127.0.0.1";
-const API_KEY = process.env.SHIM_API_KEY ?? null;
+// SHIM_API_KEY accepts one or more keys, comma-separated. Each entry may be
+// "name:key" (name becomes the access-log identity) or a bare "key" (identity
+// = first 6 chars). Keys are never logged.
+const API_KEYS = new Map(); // secret -> label
+for (const e of (process.env.SHIM_API_KEY ?? "").split(",").map((s) => s.trim()).filter(Boolean)) {
+  const i = e.indexOf(":");
+  if (i > 0) API_KEYS.set(e.slice(i + 1), e.slice(0, i));
+  else API_KEYS.set(e, `key:${e.slice(0, 6)}…`);
+}
+const API_KEY = API_KEYS.size ? "set" : null; // truthy gate; real keys live in the map
 const TIMEOUT_MS = Number(process.env.DEVIN_TIMEOUT_MS ?? 8 * 60 * 1000);
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT ?? 2);
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS ?? 30 * 60 * 1000);
@@ -434,14 +443,39 @@ app.use((req, res, next) => {
   next();
 });
 
+// Per-key access stats (in-memory; restart resets). One log line per
+// authenticated request + one per denial — no per-chunk/body logging.
+const accessLog = new Map(); // label -> {requests, last_at, last_route, last_ip, last_user}
+const SKIP_LOG = new Set(["/health"]); // monitoring noise
+
+function recordAccess(label, req) {
+  const a = accessLog.get(label) ?? { requests: 0 };
+  a.requests++;
+  a.last_at = new Date().toISOString();
+  a.last_route = `${req.method} ${req.path}`;
+  a.last_ip = req.ip;
+  a.last_user = req.body?.user ?? req.headers["x-session-id"] ?? null;
+  accessLog.set(label, a);
+  if (!SKIP_LOG.has(req.path)) {
+    console.log(`[access] ${a.last_at} key=${label} ${a.last_route} ip=${req.ip}${a.last_user ? ` user=${a.last_user}` : ""}`);
+  }
+}
+
 app.use((req, res, next) => {
   // Public routes: catalog is metadata; images/serve uses unguessable IDs and
   // the clients fetching it never send Authorization.
-  if (!API_KEY || req.path === "/v1/catalog" || req.path.startsWith("/v1/images/serve/")) return next();
+  if (!API_KEYS.size || req.path === "/v1/catalog" || req.path.startsWith("/v1/images/serve/")) return next();
   const token = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
-  if (token.length !== API_KEY.length || !crypto.timingSafeEqual(Buffer.from(token), Buffer.from(API_KEY))) {
+  const tb = Buffer.from(token);
+  let label = null;
+  for (const [k, l] of API_KEYS) {
+    if (tb.length === k.length && crypto.timingSafeEqual(tb, Buffer.from(k))) { label = l; break; }
+  }
+  if (!label) {
+    if (!SKIP_LOG.has(req.path)) console.log(`[access] ${new Date().toISOString()} DENIED ${req.method} ${req.path} ip=${req.ip}`);
     return res.status(401).json({ error: { message: "invalid api key", type: "invalid_request_error", param: null, code: "invalid_api_key" } });
   }
+  recordAccess(label, req);
   next();
 });
 
@@ -811,6 +845,12 @@ app.get("/v1/catalog", async (req, res) => {
     openaiError(res, 502, `catalog unavailable: ${e.message}`, "upstream_error");
   }
 });
+// Authenticated: per-key access stats — who called what last.
+app.get("/v1/access", (_req, res) =>
+  res.json({
+    object: "list",
+    data: [...accessLog.entries()].map(([key, a]) => ({ key, ...a })),
+  }));
 app.get("/health", (_req, res) =>
   res.json({ ok: true, transport: TRANSPORT, running, queued: queue.length, sessions: sessions.size }),
 );
@@ -1304,5 +1344,5 @@ for (const p of [
 
 app.listen(PORT, HOST, () => {
   console.log(`devin-openai-shim listening on http://${HOST}:${PORT}`);
-  console.log(`model: ${DEVIN_MODEL} | transport: ${TRANSPORT} | concurrency: ${MAX_CONCURRENT} | auth: ${API_KEY ? "on" : "off"}`);
+  console.log(`model: ${DEVIN_MODEL} | transport: ${TRANSPORT} | concurrency: ${MAX_CONCURRENT} | auth: ${API_KEYS.size ? `on (${API_KEYS.size} key${API_KEYS.size > 1 ? "s" : ""})` : "off"}`);
 });
