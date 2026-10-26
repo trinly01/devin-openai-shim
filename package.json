@@ -1,0 +1,13 @@
+{
+  "name": "devin-openai-shim",
+  "version": "0.1.0",
+  "description": "OpenAI-compatible API shim over the Devin CLI (read-only, no local command execution)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
