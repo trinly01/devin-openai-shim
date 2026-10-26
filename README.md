@@ -171,8 +171,9 @@ and `/v1/images/serve/*` (unguessable IDs for generated images).
 | `SESSION_TTL_MS` | `1800000` | Idle conversation eviction |
 | `DEVIN_BIN` | per-OS default | Override devin binary location |
 | `EMBEDDINGS_UPSTREAM` / `EMBEDDINGS_KEY` | unset | Point `/v1/embeddings` at any OpenAI-compatible endpoint (e.g. Ollama `http://127.0.0.1:11434/v1`) |
-| `ACP_MODE` | `ask` | Agent persona per session (`ask` = plain Q&A; `accept-edits`/`smart`/`plan`/`bypass` = coding modes). The coding persona mentions the workspace dir |
+| `ACP_MODE` | `smart` | Agent persona. `smart` exposes tools incl. MCP; `ask` = Q&A-only (no tools); `accept-edits`/`plan`/`bypass` = coding modes |
 | `ACP_CWD` | `%TEMP%/devin-shim-workspace` | Workspace root given to sessions. Neutral default so the agent doesn't greet "in &lt;repo&gt;" |
+| `SHIM_CONFIG` | `safe` | Permission profile: `safe` = local read-only + MCP allowed; `readonly` = also denies `mcp__*` |
 
 ## Token & cost optimization
 

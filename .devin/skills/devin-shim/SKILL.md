@@ -25,11 +25,16 @@ normalize to `tools`/`tool_choice` in both endpoints.
   `session/update` chunks → real SSE streaming.
 - Fallback transport `TRANSPORT=print` spawns `devin -p` per request
   (stateless, single-chunk stream, history flattened into the prompt).
-- `devin-readonly.json` is passed via `--config` and **hard-denies** `exec`,
-  `edit`, `Write(**)`, `Fetch(*)`, and `mcp__*`. Additionally the ACP layer
-  refuses every agent→client request (`fs/*`, `terminal/*`,
-  `session/request_permission` → cancelled). Respond-only is enforced twice —
-  do not weaken either layer.
+- `SHIM_CONFIG` selects the permission profile passed via `--config`:
+  `safe` (default, `devin-safe.json`) denies local `exec`/`edit`/`Write(**)`/
+  `Fetch(*)` but **allows `mcp__*`** — the agent can act on remote systems
+  that have an MCP server in the Devin CLI config (verified: Atlassian MCP
+  call returned real data). `readonly` (`devin-readonly.json`) also denies
+  `mcp__*`. The ACP layer additionally refuses every agent→client request
+  (`fs/*`, `terminal/*`, `session/request_permission` → cancelled). Local
+  machine stays read-only in both profiles — do not weaken either layer.
+- `ACP_MODE` default is `smart` (tools available). `ask` mode exposes NO
+  tools — remote actions are impossible in it.
 - Emulations to know before debugging: `tools` are prompt-injected and parsed
   from a `{"tool_call":{...}}` reply; `stop`/`max_tokens` truncate post-hoc;
   `usage` is **real** on `acp` — `session/prompt` returns

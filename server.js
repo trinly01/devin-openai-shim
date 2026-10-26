@@ -17,7 +17,11 @@ const DEVIN_BIN =
     ? String.raw`C:\Users\trinm\AppData\Local\Programs\Devin\resources\app\extensions\windsurf\devin\bin\devin.exe`
     : "devin");
 const DEVIN_MODEL = process.env.DEVIN_MODEL ?? "swe-2-high";
-const READONLY_CONFIG = path.join(__dirname, "devin-readonly.json");
+// SHIM_CONFIG selects the permission profile passed via --config:
+//   safe     — local machine read-only; MCP tools allowed (default)
+//   readonly — additionally denies mcp__* (no remote actions at all)
+const SHIM_CONFIG = process.env.SHIM_CONFIG ?? "safe";
+const READONLY_CONFIG = path.join(__dirname, `devin-${SHIM_CONFIG === "readonly" ? "readonly" : "safe"}.json`);
 const TRANSPORT = process.env.TRANSPORT ?? "acp"; // "acp" | "print"
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? "127.0.0.1";
@@ -42,7 +46,7 @@ const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS ?? 30 * 60 * 1000);
 // Workspace root handed to sessions and the agent's persona. Defaults keep
 // the shim a plain assistant: neutral cwd (not the repo) + "ask" mode.
 const ACP_CWD = process.env.ACP_CWD ?? path.join(os.tmpdir(), "devin-shim-workspace");
-const ACP_MODE = process.env.ACP_MODE ?? "ask";
+const ACP_MODE = process.env.ACP_MODE ?? "smart"; // "ask" = Q&A only (no tools)
 
 const MODEL = { id: DEVIN_MODEL, object: "model", created: 0, owned_by: "cognition" };
 
@@ -1366,5 +1370,5 @@ for (const p of [
 
 app.listen(PORT, HOST, () => {
   console.log(`devin-openai-shim listening on http://${HOST}:${PORT}`);
-  console.log(`model: ${DEVIN_MODEL} | transport: ${TRANSPORT} | concurrency: ${MAX_CONCURRENT} | auth: ${API_KEYS.size ? `on (${API_KEYS.size} key${API_KEYS.size > 1 ? "s" : ""})` : "off"}`);
+  console.log(`model: ${DEVIN_MODEL} | transport: ${TRANSPORT} | config: ${SHIM_CONFIG} | mode: ${ACP_MODE} | concurrency: ${MAX_CONCURRENT} | auth: ${API_KEYS.size ? `on (${API_KEYS.size} key${API_KEYS.size > 1 ? "s" : ""})` : "off"}`);
 });
