@@ -58,6 +58,12 @@ npm install
 npm start          # http://127.0.0.1:8787
 ```
 
+To expose it beyond localhost, put it behind a tunnel/reverse proxy — keep
+`HOST=127.0.0.1` and let the edge handle TLS. This deployment uses Cloudflare
+Tunnel: `https://ai.zyberlab.com/v1` → `devin-llm` → `localhost:8787`.
+`SHIM_API_KEY` auth is what guards the public route — never expose the port
+without it.
+
 ## Endpoints
 
 | Method | Path | Notes |

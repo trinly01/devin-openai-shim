@@ -31,8 +31,8 @@ normalize to `tools`/`tool_choice` in both endpoints.
   verified: Atlassian call returned real data) plus `web_search`/`webfetch`/
   `fetch`/`browser*` (verified: live web search). `readonly` also denies
   all of these — pure respond-only, no side effects anywhere.
-  `Fetch(*)` moved from deny to allow in safe mode to permit browsing.
-  `mcp__*`. The ACP layer additionally refuses every agent→client request
+  `Fetch(*)` is allowed in safe mode (browsing) but denied in readonly.
+  The ACP layer additionally refuses every agent→client request
   (`fs/*`, `terminal/*`, `session/request_permission` → cancelled). Local
   machine stays read-only in both profiles — do not weaken either layer.
 - `ACP_MODE` default is `smart` (tools available). `ask` mode exposes NO
@@ -66,7 +66,8 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"hello"}]}'
 ```
 
-When `SHIM_API_KEY` is set it guards **every** route including `/health` —
+When `SHIM_API_KEY` is set it guards every route except `/v1/catalog` and
+`/v1/images/serve/:id` —
 requests without `Authorization: Bearer` get 401. Multi-key formats (combine):
 comma-separated `name:key,name2:key2` on `SHIM_API_KEY`, or one per line
 `SHIM_API_KEY_<NAME>=<secret>` (env files are line-based — no multi-line
@@ -119,10 +120,11 @@ this** — Desktop and CLI keep separate credential stores. If
 
 `DEVIN_MODEL` (default `swe-2-high`), `TRANSPORT` (`acp`|`print`), `PORT`,
 `HOST`, `SHIM_API_KEY`, `MAX_CONCURRENT` (print only), `DEVIN_TIMEOUT_MS`,
-`SESSION_TTL_MS`, `DEVIN_BIN`, `EMBEDDINGS_UPSTREAM`, `EMBEDDINGS_KEY`,
-`ACP_MODE` (default `ask`), `ACP_CWD` (default temp dir — the cwd becomes the
-workspace the coding persona names in replies, so don't point it at a repo
-unless you want "let's work on &lt;repo&gt;" greetings).
+`SESSION_TTL_MS`, `DEVIN_BIN`, `SHIM_CONFIG` (default `safe` →
+`devin-safe.json`; `readonly` → `devin-readonly.json`), `EMBEDDINGS_UPSTREAM`,
+`EMBEDDINGS_KEY`, `ACP_MODE` (default `smart`), `ACP_CWD` (default temp dir —
+the cwd becomes the workspace the coding persona names in replies, so don't
+point it at a repo unless you want "let's work on &lt;repo&gt;" greetings).
 
 ## Public catalog endpoint
 
@@ -157,6 +159,19 @@ Confirmed working end-to-end (chat + SSE streaming, 2026-10-26):
   If Directus runs in Docker use `http://host.docker.internal:8787/v1` —
   `127.0.0.1` inside a container doesn't reach the host.
 - **curl** non-streaming and `stream:true` requests (see Run/test above).
+- **Cloudflare Tunnel** → `https://ai.zyberlab.com/v1` verified end-to-end
+  (health 200 with auth, 401 without) 2026-10-26.
+
+## Public exposure (this deployment)
+
+`ai.zyberlab.com` → Cloudflare Tunnel `devin-llm` (ID
+`76820579-dde5-492b-826e-1a47fc7b03d4`) → `http://localhost:8787`. The
+tunnel's ingress is **cloud-managed** (daemon logs `Updated to new
+configuration` from Cloudflare, ignoring local yml edits) — add/remove public
+hostnames in the Zero Trust dashboard or tunnel app, not the yml. Local
+config: `%APPDATA%\com.administrator.tunnel-cloudflared-desktop\accounts\
+zyberlab.com\devin-llm.yml`. Externally `HOST` stays `127.0.0.1`; the tunnel
+is the only exposure and `SHIM_API_KEY` auth is what guards the public route.
 
 ## Reference documentation
 
@@ -203,3 +218,12 @@ Canonical topics and where they live in those docs:
 - Restarting: killing the npm shell leaves `node server.js` alive holding
   port 8787 (`EADDRINUSE` on next start). Kill it by PID:
   `netstat -ano | findstr :8787` → `taskkill /PID <pid> /F`.
+- **Cloudflare error 1033 / stale tunnel route:** a hostname CNAME'd to a
+  *deleted* tunnel can't be re-pointed by name (`route dns` says "already
+  configured" and skips). Fix: `cloudflared tunnel route dns
+  --overwrite-dns <tunnel-ID> <hostname>` — the explicit ID bypasses the
+  name-based ownership check. cert.pem authenticates tunnel ops but NOT
+  general DNS/zone API calls (`Invalid request headers`), so record deletes
+  still need the dashboard.
+- `cloudflared` on Windows won't auto-update and warns it can't load the
+  system CA pool — harmless for tunnels to localhost origins.
