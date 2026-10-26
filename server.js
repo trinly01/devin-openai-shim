@@ -1527,6 +1527,20 @@ for (const p of [
   app.all(p, unsupported(p));
 }
 
+// JSON catch-alls: unknown routes and middleware/body-parse errors must also
+// answer in the OpenAI error shape — Express defaults emit HTML otherwise.
+app.use((req, res) =>
+  openaiError(res, 404, `unknown route ${req.method} ${req.path}`, "not_found"),
+);
+app.use((err, req, res, _next) => {
+  if (res.headersSent) return res.end();
+  const status = err.status ?? err.statusCode ?? 500;
+  const msg = err.type === "entity.too.large" ? "request body exceeds 4mb limit"
+    : err.type === "entity.parse.failed" ? "malformed JSON body"
+    : err.message ?? "internal error";
+  openaiError(res, status, msg, status >= 500 ? "server_error" : "invalid_request_error");
+});
+
 app.listen(PORT, HOST, () => {
   console.log(`devin-openai-shim listening on http://${HOST}:${PORT}`);
   console.log(`model: ${DEVIN_MODEL} | transport: ${TRANSPORT} | config: ${SHIM_CONFIG} | mode: ${ACP_MODE} | concurrency: ${MAX_CONCURRENT} | auth: ${API_KEYS.size ? `on (${API_KEYS.size} key${API_KEYS.size > 1 ? "s" : ""})` : "off"}`);
