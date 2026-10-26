@@ -9,13 +9,59 @@ import crypto from "node:crypto";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Windows: resolve the CLI bundled inside Devin Desktop. macOS/Linux: assume
-// the standalone `devin` binary is on PATH (set DEVIN_BIN to override either).
-const DEVIN_BIN =
-  process.env.DEVIN_BIN ??
-  (process.platform === "win32"
-    ? String.raw`C:\Users\trinm\AppData\Local\Programs\Devin\resources\app\extensions\windsurf\devin\bin\devin.exe`
-    : "devin");
+// Locate the Devin CLI binary. Order:
+//   1. DEVIN_BIN env override (absolute path or bare command name)
+//   2. Windows: the CLI bundled inside Devin Desktop, resolved via
+//      %LOCALAPPDATA% so it works under any user profile
+//   3. `devin` on PATH (standalone install; the macOS/Linux default)
+// Resolution runs once at startup so a missing CLI fails fast with a clear
+// message instead of surfacing as `spawn … ENOENT` on the first request.
+function findOnPath(exe) {
+  const exts = process.platform === "win32" ? [".exe", ".cmd", ".bat"] : [""];
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (!dir) continue;
+    for (const ext of exts) {
+      const p = path.join(dir, exe + ext);
+      try {
+        fs.accessSync(p, fs.constants.X_OK);
+        return p;
+      } catch {}
+    }
+  }
+  return null;
+}
+
+function resolveDevinBin() {
+  const override = process.env.DEVIN_BIN?.trim();
+  if (override) {
+    // Explicit path: must exist. Bare name: resolve against PATH.
+    if (/[/\\]/.test(override)) return fs.existsSync(override) ? override : null;
+    return findOnPath(override);
+  }
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local");
+    const bundled = path.join(
+      localAppData, "Programs", "Devin", "resources", "app",
+      "extensions", "windsurf", "devin", "bin", "devin.exe",
+    );
+    if (fs.existsSync(bundled)) return bundled;
+  }
+  return findOnPath("devin");
+}
+
+const DEVIN_BIN = resolveDevinBin();
+if (!DEVIN_BIN) {
+  console.error(
+    "[devin-shim] FATAL: Devin CLI not found. Install Devin Desktop or the " +
+      "standalone CLI, run `devin auth login`, or set DEVIN_BIN in .env to the binary path.",
+  );
+  process.exit(1);
+}
+// Windows cannot spawn .cmd/.bat shims without a shell — only applies if PATH
+// resolution landed on a wrapper rather than devin.exe itself.
+const DEVIN_NEEDS_SHELL =
+  process.platform === "win32" && [".cmd", ".bat"].includes(path.extname(DEVIN_BIN).toLowerCase());
+console.log(`[devin-shim] Devin CLI: ${DEVIN_BIN}${DEVIN_NEEDS_SHELL ? " (via shell)" : ""}`);
 const DEVIN_MODEL = process.env.DEVIN_MODEL ?? "swe-2-high";
 // SHIM_CONFIG selects the permission profile passed via --config:
 //   safe     — local machine read-only; MCP tools allowed (default)
@@ -262,7 +308,7 @@ function runDevinPrint(prompt) {
           "--config", READONLY_CONFIG,
           "--respect-workspace-trust", "false",
         ];
-        const child = spawn(DEVIN_BIN, args, { cwd: __dirname, windowsHide: true, env: CHILD_ENV });
+        const child = spawn(DEVIN_BIN, args, { cwd: __dirname, windowsHide: true, env: CHILD_ENV, shell: DEVIN_NEEDS_SHELL });
         let out = "", err = "";
         const timer = setTimeout(() => {
           child.kill();
@@ -274,7 +320,10 @@ function runDevinPrint(prompt) {
         child.on("close", (code) => {
           clearTimeout(timer);
           if (code === 0) resolve(out.trim());
-          else reject(new Error(`devin exited ${code}: ${err.trim() || out.trim()}`));
+          else {
+            const e = new Error(`devin exited ${code}: ${err.trim() || out.trim()}`);
+            reject(isAuthError(e) ? new Error(authRemedy(e)) : e);
+          }
         });
       }),
   );
@@ -301,7 +350,7 @@ class AcpClient {
     this.proc = spawn(
       DEVIN_BIN,
       ["--config", READONLY_CONFIG, "acp", "--model", DEVIN_MODEL],
-      { cwd: __dirname, windowsHide: true, stdio: ["pipe", "pipe", "inherit"], env: CHILD_ENV },
+      { cwd: __dirname, windowsHide: true, stdio: ["pipe", "pipe", "inherit"], env: CHILD_ENV, shell: DEVIN_NEEDS_SHELL },
     );
     const rl = readline.createInterface({ input: this.proc.stdout });
     rl.on("line", (line) => this.onLine(line));
@@ -385,7 +434,7 @@ class AcpClient {
       }
       return res.sessionId;
     } catch (e) {
-      if (/auth/i.test(e.message)) throw new Error(`${e.message} — run \`devin auth login\``);
+      if (isAuthError(e)) throw new Error(authRemedy(e));
       throw e;
     }
   }
@@ -403,6 +452,47 @@ class AcpClient {
 }
 
 const acp = new AcpClient();
+
+// ---------------------------------------------------------------------------
+// Auth recovery: when a spawned CLI reports "Not logged in", pop a real
+// console window running `devin auth login` on the user's desktop. The login
+// flow is interactive (browser PKCE or manual token) and needs a TTY — it
+// cannot be driven headlessly — so the window is the honest handoff.
+// Debounced so a burst of failing requests opens a single window.
+// Disable with DEVIN_AUTO_LOGIN=0.
+// ---------------------------------------------------------------------------
+const AUTO_LOGIN = !/^(0|false|off)$/i.test(process.env.DEVIN_AUTO_LOGIN ?? "");
+const AUTH_LOGIN_DEBOUNCE_MS = 60_000;
+let lastLoginLaunch = 0;
+
+const isAuthError = (e) =>
+  /not logged in|auth(entication)? (required|failed|error)|\bunauthorized\b/i.test(e?.message ?? String(e));
+
+function triggerAuthLogin() {
+  if (!AUTO_LOGIN) return false;
+  const now = Date.now();
+  if (now - lastLoginLaunch < AUTH_LOGIN_DEBOUNCE_MS) return false;
+  lastLoginLaunch = now;
+  if (process.platform !== "win32") {
+    console.warn("[devin-shim] auth required — run `devin auth login` in a terminal");
+    return false;
+  }
+  // start "<title>" opens a real console window; cmd /k keeps it open so the
+  // user sees the outcome. Inner doubled quotes survive cmd's quote stripping.
+  spawn(
+    `start "Devin Login" cmd /k ""${DEVIN_BIN}" auth login"`,
+    { shell: true, detached: true, stdio: "ignore", windowsHide: true, env: CHILD_ENV },
+  ).unref();
+  console.log("[devin-shim] auth failure — launched `devin auth login` window");
+  return true;
+}
+
+// Annotate the surfaced error and kick the login window when appropriate.
+function authRemedy(e) {
+  return triggerAuthLogin()
+    ? `${e.message} — login window launched; complete it, then retry`
+    : e.message;
+}
 
 // Conversation -> ACP session map. `user` field (or x-session-id header) is
 // the conversation key; without one, every call gets a fresh session and the
@@ -437,6 +527,9 @@ async function acpChat(convKey, messages, onChunk) {
       s.hasHistory = true;
       return { text: acc, usage: r?.usage ?? null };
     } catch (e) {
+      // Auth failure can't be fixed by recreating the session — kick the
+      // login window and fail fast instead of a pointless replay.
+      if (isAuthError(e)) throw new Error(authRemedy(e));
       // Session may have died with a restarted acp process — recreate once.
       s.sessionId = await acp.newSession();
       s.hasHistory = false;
@@ -796,7 +889,7 @@ let catalogCache = null; // { at, data, stale }
 function runModelsList() {
   return new Promise((resolve, reject) => {
     const child = spawn(DEVIN_BIN, ["models", "list", "--format", "json"], {
-      cwd: __dirname, windowsHide: true, env: CHILD_ENV,
+      cwd: __dirname, windowsHide: true, env: CHILD_ENV, shell: DEVIN_NEEDS_SHELL,
     });
     let out = "", err = "";
     const timer = setTimeout(() => { child.kill(); reject(new Error("models list timed out")); }, 30_000);
@@ -805,7 +898,10 @@ function runModelsList() {
     child.on("error", (e) => { clearTimeout(timer); reject(e); });
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (code !== 0) return reject(new Error(err.trim() || `devin models list exited ${code}`));
+      if (code !== 0) {
+        const e = new Error(err.trim() || `devin models list exited ${code}`);
+        return reject(isAuthError(e) ? new Error(authRemedy(e)) : e);
+      }
       try { resolve(JSON.parse(out)); } catch (e) { reject(e); }
     });
   });

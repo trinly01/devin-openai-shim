@@ -29,7 +29,7 @@ If `devin` isn't on PATH on Windows, use the bundled binary:
 
 | | Windows | macOS / Linux |
 |---|---|---|
-| CLI binary | Resolved from Devin Desktop bundle automatically | `devin` must be on PATH (standalone installer) — or set `DEVIN_BIN` |
+| CLI binary | Auto-detected at startup: Devin Desktop bundle (via `%LOCALAPPDATA%`) → `devin` on PATH → set `DEVIN_BIN` for anything else | `devin` on PATH (standalone installer) — or set `DEVIN_BIN` |
 | Credentials | `%APPDATA%\devin\credentials.toml` | `~/.config/devin/credentials.toml` |
 | User config | `%APPDATA%\devin\config.json` | `~/.config/devin/config.json` |
 | Runtime | Node 18+ | Node 18+ |

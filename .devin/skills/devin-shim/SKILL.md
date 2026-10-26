@@ -88,12 +88,17 @@ this** — Desktop and CLI keep separate credential stores. If
 
 ## Platform notes
 
-- **Windows**: `server.js` defaults `DEVIN_BIN` to the CLI bundled in Devin
-  Desktop. Credentials at `%APPDATA%\devin\credentials.toml`; user config at
+- **Windows**: `server.js` auto-detects the CLI at startup — first the
+  Devin Desktop bundle resolved via `%LOCALAPPDATA%` (per-user, so it works
+  under any profile), then `devin` on PATH. Credentials at
+  `%APPDATA%\devin\credentials.toml`; user config at
   `%APPDATA%\devin\config.json`.
-- **macOS/Linux**: `DEVIN_BIN` defaults to `devin` on PATH (standalone
-  installer). Credentials at `~/.config/devin/credentials.toml`; user config
-  at `~/.config/devin/config.json`.
+- **macOS/Linux**: `devin` resolved from PATH (standalone installer).
+  Credentials at `~/.config/devin/credentials.toml`; user config at
+  `~/.config/devin/config.json`.
+- On both: `DEVIN_BIN` env overrides everything (absolute path or bare
+  command name). **The shim exits at startup if no CLI is found** — a
+  missing binary never reaches request time as `spawn … ENOENT`.
 - Node 18+ on both. Everything else is platform-neutral.
 
 ## Extended surface (emulated where honest, 501 where not)
@@ -122,7 +127,10 @@ this** — Desktop and CLI keep separate credential stores. If
 `HOST`, `SHIM_API_KEY`, `MAX_CONCURRENT` (print only), `DEVIN_TIMEOUT_MS`,
 `SESSION_TTL_MS`, `DEVIN_BIN`, `SHIM_CONFIG` (default `safe` →
 `devin-safe.json`; `readonly` → `devin-readonly.json`), `EMBEDDINGS_UPSTREAM`,
-`EMBEDDINGS_KEY`, `ACP_MODE` (default `smart`), `ACP_CWD` (default temp dir —
+`EMBEDDINGS_KEY`, `DEVIN_AUTO_LOGIN` (default on: auth failure in a spawned
+CLI pops a real console window running `devin auth login`, debounced 60s —
+Windows only, since the flow needs a TTY), `ACP_MODE` (default `smart`),
+`ACP_CWD` (default temp dir —
 the cwd becomes the workspace the coding persona names in replies, so don't
 point it at a repo unless you want "let's work on &lt;repo&gt;" greetings).
 
