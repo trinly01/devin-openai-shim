@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import readline from "node:readline";
 import fs from "node:fs";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 
@@ -38,6 +39,10 @@ const API_KEY = API_KEYS.size ? "set" : null; // truthy gate; real keys live in 
 const TIMEOUT_MS = Number(process.env.DEVIN_TIMEOUT_MS ?? 8 * 60 * 1000);
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT ?? 2);
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS ?? 30 * 60 * 1000);
+// Workspace root handed to sessions and the agent's persona. Defaults keep
+// the shim a plain assistant: neutral cwd (not the repo) + "ask" mode.
+const ACP_CWD = process.env.ACP_CWD ?? path.join(os.tmpdir(), "devin-shim-workspace");
+const ACP_MODE = process.env.ACP_MODE ?? "ask";
 
 const MODEL = { id: DEVIN_MODEL, object: "model", created: 0, owned_by: "cognition" };
 
@@ -367,7 +372,13 @@ class AcpClient {
   async newSession() {
     await this.ensureStarted();
     try {
-      const res = await this.request("session/new", { cwd: __dirname, mcpServers: [] });
+      const res = await this.request("session/new", { cwd: ACP_CWD, mcpServers: [] });
+      // ACP mode selects the agent's built-in persona. "ask" is the plain
+      // Q&A mode — without it the coding persona greets with "what would you
+      // like to work on in <cwd>".
+      if (ACP_MODE) {
+        await this.request("session/set_mode", { sessionId: res.sessionId, modeId: ACP_MODE }).catch(() => {});
+      }
       return res.sessionId;
     } catch (e) {
       if (/auth/i.test(e.message)) throw new Error(`${e.message} — run \`devin auth login\``);
@@ -868,6 +879,8 @@ app.get("/health", (_req, res) =>
 // Extended OpenAI surface — emulated where the backend allows, honest 501
 // where it doesn't.
 // ===========================================================================
+
+fs.mkdirSync(ACP_CWD, { recursive: true });
 
 const DATA_DIR = path.join(__dirname, ".data");
 const FILES_DIR = path.join(DATA_DIR, "files");

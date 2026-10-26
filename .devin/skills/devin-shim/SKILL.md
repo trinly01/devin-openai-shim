@@ -112,7 +112,10 @@ this** — Desktop and CLI keep separate credential stores. If
 
 `DEVIN_MODEL` (default `swe-2-high`), `TRANSPORT` (`acp`|`print`), `PORT`,
 `HOST`, `SHIM_API_KEY`, `MAX_CONCURRENT` (print only), `DEVIN_TIMEOUT_MS`,
-`SESSION_TTL_MS`, `DEVIN_BIN`, `EMBEDDINGS_UPSTREAM`, `EMBEDDINGS_KEY`.
+`SESSION_TTL_MS`, `DEVIN_BIN`, `EMBEDDINGS_UPSTREAM`, `EMBEDDINGS_KEY`,
+`ACP_MODE` (default `ask`), `ACP_CWD` (default temp dir — the cwd becomes the
+workspace the coding persona names in replies, so don't point it at a repo
+unless you want "let's work on &lt;repo&gt;" greetings).
 
 ## Public catalog endpoint
 
