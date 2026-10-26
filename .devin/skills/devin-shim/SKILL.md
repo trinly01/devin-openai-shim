@@ -6,8 +6,10 @@ description: Run, test, and modify the OpenAI-compatible API shim over the Devin
 # devin-openai-shim
 
 Local OpenAI-compatible API (`/v1/chat/completions`, `/v1/responses`,
-`/v1/models`, `/v1/catalog`, `/health`) backed by the Devin CLI running
-respond-only on SWE-2.
+`/v1/models`, `/v1/catalog`, `/v1/files`, `/v1/batches`, `/v1/moderations`,
+`/v1/images/generations`, `/v1/assistants`+`threads`+`runs`,
+`/v1/conversations`, `/v1/embeddings` via proxy, `/health`) backed by the
+Devin CLI running respond-only on SWE-2.
 
 `/v1/responses` supports `instructions`, string/item-array `input`,
 function tools, `previous_response_id` → resumes the same agent session
@@ -80,11 +82,31 @@ this** — Desktop and CLI keep separate credential stores. If
   at `~/.config/devin/config.json`.
 - Node 18+ on both. Everything else is platform-neutral.
 
+## Extended surface (emulated where honest, 501 where not)
+
+- `/v1/files` — real disk storage under `.data/files/` + `.data/files.json`
+  index; multipart and JSON-base64 uploads.
+- `/v1/batches` — real async JSONL processor over our own chat-completions /
+  responses cores (`runChatCompletion`, `normalizeResponsesRequest` +
+  `generateOne`); output becomes a `file-*`.
+- `/v1/moderations` — one agent turn classifying into the omni category set.
+- `/v1/images/generations` — model writes SVG; `b64_json` or `url` served by
+  the shim (`/v1/images/serve/:id` is auth-exempt, unguessable IDs).
+- `/v1/assistants|threads|runs` — in-memory stores; a run sends the thread
+  through `generateOne` keyed `thread:<id>` → persistent session, then
+  appends the assistant reply; `steps` returns `[]`.
+- `/v1/conversations` — trivial store.
+- `/v1/embeddings` — **proxy only**: set `EMBEDDINGS_UPSTREAM` (+ optional
+  `EMBEDDINGS_KEY`) to any OpenAI-compatible endpoint; without it → 501.
+- Still 501 by necessity: audio (`promptCapabilities.audio: false`),
+  fine_tuning, vector_stores (needs real embeddings), realtime, uploads,
+  videos, evals, containers, images/edits+variations.
+
 ## Env vars
 
 `DEVIN_MODEL` (default `swe-2-high`), `TRANSPORT` (`acp`|`print`), `PORT`,
 `HOST`, `SHIM_API_KEY`, `MAX_CONCURRENT` (print only), `DEVIN_TIMEOUT_MS`,
-`SESSION_TTL_MS`, `DEVIN_BIN`.
+`SESSION_TTL_MS`, `DEVIN_BIN`, `EMBEDDINGS_UPSTREAM`, `EMBEDDINGS_KEY`.
 
 ## Public catalog endpoint
 

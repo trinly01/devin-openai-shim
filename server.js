@@ -2,6 +2,7 @@ import express from "express";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import readline from "node:readline";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 
@@ -434,7 +435,9 @@ app.use((req, res, next) => {
 });
 
 app.use((req, res, next) => {
-  if (!API_KEY || req.path === "/v1/catalog") return next(); // catalog is public
+  // Public routes: catalog is metadata; images/serve uses unguessable IDs and
+  // the clients fetching it never send Authorization.
+  if (!API_KEY || req.path === "/v1/catalog" || req.path.startsWith("/v1/images/serve/")) return next();
   const token = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
   if (token.length !== API_KEY.length || !crypto.timingSafeEqual(Buffer.from(token), Buffer.from(API_KEY))) {
     return res.status(401).json({ error: { message: "invalid api key", type: "invalid_request_error", param: null, code: "invalid_api_key" } });
@@ -490,6 +493,36 @@ async function generateOne(body, onChunk, convKeyOverride) {
     : runDevinPrint(flattenMessages(msgs)).then((text) => ({ text, usage: null }));
 }
 
+// Non-streaming core, shared by the route and the batch processor.
+async function runChatCompletion(body) {
+  normalizeLegacyTools(body);
+  const n = Math.min(Math.max(body.n ?? 1, 1), 4);
+  const baseKey = body.user ?? body.__sessionHeader ?? `anon:${crypto.randomUUID()}`;
+  const results = await Promise.all(
+    // n>1: each choice needs an independent session, not the shared convo
+    Array.from({ length: n }, (_, i) => generateOne(body, undefined, `${baseKey}#${i}`)),
+  );
+  const estPrompt = estimateTokens(JSON.stringify(body.messages));
+  const choices = results.map((r, i) => buildChoice(r.text, body, i));
+  const promptToks = results.reduce((a, r) => a + (r.usage?.inputTokens ?? estPrompt), 0);
+  const completionToks = results.reduce((a, r) => a + (r.usage?.outputTokens ?? estimateTokens(r.text)), 0);
+  const cachedToks = results.reduce((a, r) => a + (r.usage?.cachedReadTokens ?? 0), 0);
+  return {
+    id: `chatcmpl-${crypto.randomBytes(12).toString("hex")}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: DEVIN_MODEL,
+    choices: choices.map(({ _promptText, ...c }) => c),
+    usage: {
+      prompt_tokens: promptToks,
+      completion_tokens: completionToks,
+      total_tokens: promptToks + completionToks,
+      ...(cachedToks ? { prompt_tokens_details: { cached_tokens: cachedToks } } : {}),
+      ...(results.every((r) => !r.usage) ? { estimated: true } : {}),
+    },
+  };
+}
+
 app.post("/v1/chat/completions", async (req, res) => {
   const body = req.body ?? {};
   body.__sessionHeader = req.headers["x-session-id"];
@@ -535,30 +568,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       return res.end();
     }
 
-    const baseKey = body.user ?? body.__sessionHeader ?? crypto.randomUUID();
-    const results = await Promise.all(
-      // n>1: each choice needs an independent session, not the shared convo
-      Array.from({ length: n }, (_, i) => generateOne(body, undefined, `${baseKey}#${i}`)),
-    );
-    const estPrompt = estimateTokens(JSON.stringify(body.messages));
-    const choices = results.map((r, i) => buildChoice(r.text, body, i));
-    const promptToks = results.reduce((a, r) => a + (r.usage?.inputTokens ?? estPrompt), 0);
-    const completionToks = results.reduce((a, r) => a + (r.usage?.outputTokens ?? estimateTokens(r.text)), 0);
-    const cachedToks = results.reduce((a, r) => a + (r.usage?.cachedReadTokens ?? 0), 0);
-    res.json({
-      id: `chatcmpl-${crypto.randomBytes(12).toString("hex")}`,
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model: DEVIN_MODEL,
-      choices: choices.map(({ _promptText, ...c }) => c),
-      usage: {
-        prompt_tokens: promptToks,
-        completion_tokens: completionToks,
-        total_tokens: promptToks + completionToks,
-        ...(cachedToks ? { prompt_tokens_details: { cached_tokens: cachedToks } } : {}),
-        ...(results.every((r) => !r.usage) ? { estimated: true } : {}),
-      },
-    });
+    res.json(await runChatCompletion(body));
   } catch (e) {
     if (heartbeat) clearInterval(heartbeat);
     if (res.headersSent) return res.end();
@@ -625,22 +635,15 @@ function buildResponse(id, text, body, usage, status = "completed") {
   };
 }
 
-app.post("/v1/responses", async (req, res) => {
-  const body = req.body ?? {};
-  if (body.model && body.model !== DEVIN_MODEL) {
-    return openaiError(res, 404, `model '${body.model}' not found (shim serves '${DEVIN_MODEL}')`, "model_not_found");
-  }
-  if (body.input === undefined || body.input === null) {
-    return openaiError(res, 400, "input is required");
-  }
+// Shared Responses normalization: returns {convKey, normBody} or {error}.
+function normalizeResponsesRequest(body, sessionHeader) {
   let convKey;
   if (body.previous_response_id) {
     convKey = respStore.get(body.previous_response_id);
-    if (!convKey) return openaiError(res, 400, `previous_response_id '${body.previous_response_id}' not found`);
+    if (!convKey) return { error: `previous_response_id '${body.previous_response_id}' not found` };
   } else {
-    convKey = `resp:${body.user ?? req.headers["x-session-id"] ?? crypto.randomUUID()}`;
+    convKey = `resp:${body.user ?? sessionHeader ?? crypto.randomUUID()}`;
   }
-
   const normBody = {
     messages: [
       ...(body.instructions ? [{ role: "system", content: body.instructions }] : []),
@@ -659,6 +662,19 @@ app.post("/v1/responses", async (req, res) => {
     response_format: body.text?.format?.type === "json_object" || body.text?.format?.type === "json_schema"
       ? { type: "json_object" } : undefined,
   };
+  return { convKey, normBody };
+}
+
+app.post("/v1/responses", async (req, res) => {
+  const body = req.body ?? {};
+  if (body.model && body.model !== DEVIN_MODEL) {
+    return openaiError(res, 404, `model '${body.model}' not found (shim serves '${DEVIN_MODEL}')`, "model_not_found");
+  }
+  if (body.input === undefined || body.input === null) {
+    return openaiError(res, 400, "input is required");
+  }
+  const { convKey, normBody, error } = normalizeResponsesRequest(body, req.headers["x-session-id"]);
+  if (error) return openaiError(res, 400, error);
   if (!normBody.messages.length) return openaiError(res, 400, "input produced no messages");
 
   const respId = rid("resp");
@@ -799,11 +815,489 @@ app.get("/health", (_req, res) =>
   res.json({ ok: true, transport: TRANSPORT, running, queued: queue.length, sessions: sessions.size }),
 );
 
-// Everything else in the OpenAI surface: explicit 501 instead of silent 404.
+// ===========================================================================
+// Extended OpenAI surface — emulated where the backend allows, honest 501
+// where it doesn't.
+// ===========================================================================
+
+const DATA_DIR = path.join(__dirname, ".data");
+const FILES_DIR = path.join(DATA_DIR, "files");
+const IMAGES_DIR = path.join(DATA_DIR, "images");
+fs.mkdirSync(FILES_DIR, { recursive: true });
+fs.mkdirSync(IMAGES_DIR, { recursive: true });
+
+// Minimal multipart/form-data parser (enough for OpenAI file uploads).
+function readMultipart(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const boundary = (req.headers["content-type"] ?? "").split("boundary=")[1];
+      if (!boundary) return reject(new Error("multipart: missing boundary"));
+      const buf = Buffer.concat(chunks);
+      const sep = Buffer.from(`--${boundary}`);
+      const parts = {};
+      let pos = buf.indexOf(sep);
+      while (pos >= 0) {
+        pos += sep.length;
+        if (buf[pos] === 0x2d) break; // trailing --
+        if (buf[pos] === 0x0d) pos += 2; // CRLF
+        const next = buf.indexOf(sep, pos);
+        const seg = buf.slice(pos, next < 0 ? buf.length : next);
+        const hdrEnd = seg.indexOf("\r\n\r\n");
+        const hdr = seg.slice(0, hdrEnd).toString("latin1");
+        let data = seg.slice(hdrEnd + 4);
+        if (data.length >= 2 && data[data.length - 2] === 0x0d) data = data.slice(0, -2);
+        const name = /name="([^"]+)"/.exec(hdr)?.[1];
+        const filename = /filename="([^"]*)"/.exec(hdr)?.[1];
+        if (name) parts[name] = { filename, data };
+        pos = next;
+      }
+      resolve(parts);
+    });
+    req.on("error", reject);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Files — local disk storage. Real endpoint, real persistence.
+// ---------------------------------------------------------------------------
+const filesIndex = new Map(); // id -> meta
+const filesIndexPath = path.join(DATA_DIR, "files.json");
+try {
+  for (const m of JSON.parse(fs.readFileSync(filesIndexPath, "utf8"))) filesIndex.set(m.id, m);
+} catch { /* fresh store */ }
+const saveFilesIndex = () =>
+  fs.writeFileSync(filesIndexPath, JSON.stringify([...filesIndex.values()], null, 0));
+
+function fileObject(m) {
+  return { id: m.id, object: "file", bytes: m.bytes, created_at: m.created_at, filename: m.filename, purpose: m.purpose };
+}
+
+async function storeFile(data, filename, purpose) {
+  const id = `file-${crypto.randomBytes(12).toString("hex")}`;
+  fs.writeFileSync(path.join(FILES_DIR, id), data);
+  const meta = { id, bytes: data.length, created_at: Math.floor(Date.now() / 1000), filename: filename ?? id, purpose: purpose ?? "user_data" };
+  filesIndex.set(id, meta);
+  saveFilesIndex();
+  return meta;
+}
+
+app.post("/v1/files", async (req, res) => {
+  try {
+    if ((req.headers["content-type"] ?? "").includes("multipart/form-data")) {
+      const parts = await readMultipart(req);
+      if (!parts.file?.data?.length) return openaiError(res, 400, "multipart 'file' part is required");
+      const meta = await storeFile(parts.file.data, parts.file.filename, parts.purpose?.data?.toString());
+      return res.json(fileObject(meta));
+    }
+    // JSON fallback: {file_data: "<base64|data-url>", filename, purpose}
+    const b = req.body ?? {};
+    const dm = /^data:[^;,]+;base64,(.+)$/s.exec(b.file_data ?? "")?.[1] ?? b.file_data;
+    if (!dm) return openaiError(res, 400, "file_data (base64) required for JSON uploads");
+    const meta = await storeFile(Buffer.from(dm, "base64"), b.filename, b.purpose);
+    res.json(fileObject(meta));
+  } catch (e) {
+    openaiError(res, 400, `file upload failed: ${e.message}`);
+  }
+});
+app.get("/v1/files", (_req, res) =>
+  res.json({ object: "list", data: [...filesIndex.values()].map(fileObject) }));
+app.get("/v1/files/:id", (req, res) =>
+  filesIndex.has(req.params.id) ? res.json(fileObject(filesIndex.get(req.params.id))) : openaiError(res, 404, "file not found", "file_not_found"));
+app.get("/v1/files/:id/content", (req, res) => {
+  const m = filesIndex.get(req.params.id);
+  const fp = m && path.join(FILES_DIR, m.id);
+  if (!fp || !fs.existsSync(fp)) return openaiError(res, 404, "file content not found", "file_not_found");
+  res.setHeader("Content-Type", "application/octet-stream");
+  res.setHeader("Content-Disposition", `attachment; filename="${m.filename}"`);
+  fs.createReadStream(fp).pipe(res);
+});
+app.delete("/v1/files/:id", (req, res) => {
+  const m = filesIndex.get(req.params.id);
+  if (!m) return openaiError(res, 404, "file not found", "file_not_found");
+  fs.rmSync(path.join(FILES_DIR, m.id), { force: true });
+  filesIndex.delete(m.id);
+  saveFilesIndex();
+  res.json({ id: m.id, object: "file", deleted: true });
+});
+
+// ---------------------------------------------------------------------------
+// Batches — real async processing of JSONL files through our own endpoints.
+// ---------------------------------------------------------------------------
+const batches = new Map();
+
+async function runBatchItem(item) {
+  const url = item.url ?? "";
+  try {
+    if (url.includes("/v1/chat/completions")) {
+      return { status_code: 200, request_id: `req_${crypto.randomBytes(8).toString("hex")}`, body: await runChatCompletion(item.body ?? {}) };
+    }
+    if (url.includes("/v1/responses")) {
+      const { convKey, normBody, error } = normalizeResponsesRequest(item.body ?? {}, `batch:${crypto.randomUUID()}`);
+      if (error) return { status_code: 400, body: { error: { message: error } } };
+      const respId = rid("resp");
+      const { text, usage } = await generateOne(normBody, undefined, convKey);
+      const final = buildResponse(respId, text, normBody, usage);
+      respStore.set(respId, convKey);
+      return { status_code: 200, request_id: `req_${crypto.randomBytes(8).toString("hex")}`, body: final };
+    }
+    return { status_code: 404, body: { error: { message: `endpoint '${url}' not supported in batches`, type: "invalid_request_error" } } };
+  } catch (e) {
+    return { status_code: 502, body: { error: { message: e.message, type: "upstream_error" } } };
+  }
+}
+
+async function processBatch(b) {
+  b.status = "in_progress";
+  b.in_progress_at = Math.floor(Date.now() / 1000);
+  const inputPath = path.join(FILES_DIR, b.input_file_id);
+  const outId = `file-${crypto.randomBytes(12).toString("hex")}`;
+  const outLines = [];
+  try {
+    const lines = fs.readFileSync(inputPath, "utf8").split("\n").filter((l) => l.trim());
+    b.request_counts.total = lines.length;
+    for (const line of lines) {
+      if (b.status === "cancelling" || b.status === "cancelled") break;
+      let item = {};
+      try { item = JSON.parse(line); } catch { /* malformed → error row below */ }
+      const response = item.method === "POST" || !item.method ? await runBatchItem(item) : { status_code: 400, body: { error: { message: "only POST batch items are supported" } } };
+      outLines.push(JSON.stringify({ id: `batch_req_${crypto.randomBytes(8).toString("hex")}`, custom_id: item.custom_id ?? null, response, error: null }));
+      if (response.status_code < 300) b.request_counts.completed++; else b.request_counts.failed++;
+    }
+    const outBuf = Buffer.from(outLines.join("\n") + "\n");
+    fs.writeFileSync(path.join(FILES_DIR, outId), outBuf);
+    filesIndex.set(outId, { id: outId, bytes: outBuf.length, created_at: Math.floor(Date.now() / 1000), filename: `${b.id}_output.jsonl`, purpose: "batch_output" });
+    saveFilesIndex();
+    b.output_file_id = outId;
+    b.status = b.status === "cancelling" ? "cancelled" : "completed";
+  } catch (e) {
+    b.status = "failed";
+    b.errors = { object: "list", data: [{ code: "processing_error", message: e.message }] };
+  }
+  b[b.status === "completed" ? "completed_at" : b.status === "cancelled" ? "cancelled_at" : "failed_at"] = Math.floor(Date.now() / 1000);
+}
+
+app.post("/v1/batches", async (req, res) => {
+  const { input_file_id, endpoint, completion_window } = req.body ?? {};
+  const m = filesIndex.get(input_file_id);
+  if (!m) return openaiError(res, 400, `input_file_id '${input_file_id}' not found`);
+  if (!["/v1/chat/completions", "/v1/responses"].includes(endpoint))
+    return openaiError(res, 400, `endpoint '${endpoint}' not supported (allowed: /v1/chat/completions, /v1/responses)`);
+  const b = {
+    id: `batch_${crypto.randomBytes(12).toString("hex")}`, object: "batch",
+    input_file_id, endpoint, completion_window: completion_window ?? "24h",
+    status: "validating", created_at: Math.floor(Date.now() / 1000),
+    metadata: req.body.metadata ?? {},
+    request_counts: { total: 0, completed: 0, failed: 0 },
+  };
+  batches.set(b.id, b);
+  processBatch(b).catch(() => {});
+  b.status = "validating"; // processBatch may have raced to completion on small inputs
+  res.json({ ...b });
+});
+app.get("/v1/batches", (req, res) =>
+  res.json({ object: "list", data: [...batches.values()].slice(-Number(req.query.limit ?? 20)) }));
+app.get("/v1/batches/:id", (req, res) =>
+  batches.has(req.params.id) ? res.json(batches.get(req.params.id)) : openaiError(res, 404, "batch not found", "batch_not_found"));
+app.post("/v1/batches/:id/cancel", (req, res) => {
+  const b = batches.get(req.params.id);
+  if (!b) return openaiError(res, 404, "batch not found", "batch_not_found");
+  if (["in_progress", "validating"].includes(b.status)) b.status = "cancelling";
+  res.json(b);
+});
+
+// ---------------------------------------------------------------------------
+// Moderations — LLM-emulated classifier. Emits the full OpenAI category set.
+// ---------------------------------------------------------------------------
+const MOD_CATEGORIES = [
+  "sexual", "hate", "harassment", "self-harm", "sexual/minors",
+  "hate/threatening", "violence/graphic", "self-harm/intent",
+  "self-harm/instructions", "harassment/threatening", "violence",
+];
+
+app.post("/v1/moderations", async (req, res) => {
+  const inputs = Array.isArray(req.body?.input) ? req.body.input : [req.body?.input ?? ""];
+  const results = [];
+  try {
+    for (const input of inputs) {
+      const { text } = await generateOne({
+        messages: [
+          { role: "system", content: `You are an OpenAI omni-moderation classifier. For the input text reply with ONLY a JSON object: {"flagged":boolean,"categories":{<cat>:boolean},"category_scores":{<cat>:0..1}} covering exactly these categories: ${MOD_CATEGORIES.join(",")}. No prose.` },
+          { role: "user", content: typeof input === "string" ? input : JSON.stringify(input) },
+        ],
+      }, undefined, `mod:${crypto.randomUUID()}`);
+      const m = /\{[\s\S]*\}/.exec(text)?.[0];
+      const parsed = m ? JSON.parse(m) : {};
+      const categories = Object.fromEntries(MOD_CATEGORIES.map((c) => [c, !!parsed.categories?.[c]]));
+      const scores = Object.fromEntries(MOD_CATEGORIES.map((c) => [c, Number(parsed.category_scores?.[c] ?? 0)]));
+      results.push({
+        flagged: parsed.flagged ?? Object.values(categories).some(Boolean),
+        categories, category_scores: scores,
+      });
+    }
+    res.json({ id: `modr-${crypto.randomBytes(12).toString("hex")}`, model: req.body?.model ?? "omni-moderation-emulated", results });
+  } catch (e) {
+    openaiError(res, 502, `moderation failed: ${e.message}`, "upstream_error");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Images — emulated: the model writes SVG. b64_json always available; "url"
+// response_format serves the SVG from this shim (localhost reachability only).
+// ---------------------------------------------------------------------------
+async function generateImage(promptText) {
+  const { text } = await generateOne({
+    messages: [{ role: "user", content: `You are an SVG artist. Produce an SVG image for this request, replying with ONLY the SVG markup (no prose, no fences):\n${promptText}` }],
+  }, undefined, `img:${crypto.randomUUID()}`);
+  const m = /<svg[\s\S]*<\/svg>/.exec(text)?.[0];
+  if (!m) throw new Error("model did not return SVG");
+  return m;
+}
+
+app.post("/v1/images/generations", async (req, res) => {
+  const { prompt, n: reqN = 1, size, quality, style, background, response_format } = req.body ?? {};
+  if (!prompt) return openaiError(res, 400, "prompt is required");
+  const n = Math.min(Math.max(reqN, 1), 4);
+  const fullPrompt = [prompt, size && `size ${size}`, quality && `quality ${quality}`, style && `style ${style}`, background && `background ${background}`].filter(Boolean).join("; ");
+  try {
+    const data = [];
+    for (let i = 0; i < n; i++) {
+      const svg = await generateImage(fullPrompt);
+      if (response_format === "url") {
+        const id = `img-${crypto.randomBytes(12).toString("hex")}`;
+        fs.writeFileSync(path.join(IMAGES_DIR, `${id}.svg`), svg);
+        data.push({ url: `http://${HOST}:${PORT}/v1/images/serve/${id}` });
+      } else {
+        data.push({ b64_json: Buffer.from(svg).toString("base64"), revised_prompt: prompt });
+      }
+    }
+    res.json({ created: Math.floor(Date.now() / 1000), data });
+  } catch (e) {
+    openaiError(res, 502, `image generation failed: ${e.message}`, "upstream_error");
+  }
+});
+app.get("/v1/images/serve/:id", (req, res) => {
+  const fp = path.join(IMAGES_DIR, `${req.params.id}.svg`);
+  if (!fs.existsSync(fp)) return openaiError(res, 404, "image not found");
+  res.setHeader("Content-Type", "image/svg+xml");
+  fs.createReadStream(fp).pipe(res);
+});
+
+// ---------------------------------------------------------------------------
+// Assistants + Threads + Runs — in-memory stores; runs execute through the
+// shim keyed by thread id (persistent ACP session → real multi-turn).
+// ---------------------------------------------------------------------------
+const assistants = new Map();
+const threads = new Map();
+const runs = new Map();
+
+const asstObject = (a) => ({
+  id: a.id, object: "assistant", created_at: a.created_at, name: a.name ?? null,
+  description: a.description ?? null, model: a.model ?? DEVIN_MODEL,
+  instructions: a.instructions ?? null, tools: a.tools ?? [],
+  tool_resources: a.tool_resources ?? {}, metadata: a.metadata ?? {},
+  temperature: a.temperature ?? null, top_p: a.top_p ?? null, response_format: a.response_format ?? "auto",
+});
+
+app.post("/v1/assistants", (req, res) => {
+  const a = { id: `asst_${crypto.randomBytes(12).toString("hex")}`, created_at: Math.floor(Date.now() / 1000), ...req.body };
+  assistants.set(a.id, a);
+  res.json(asstObject(a));
+});
+app.get("/v1/assistants", (req, res) =>
+  res.json({ object: "list", data: [...assistants.values()].map(asstObject), first_id: null, last_id: null, has_more: false }));
+app.get("/v1/assistants/:id", (req, res) =>
+  assistants.has(req.params.id) ? res.json(asstObject(assistants.get(req.params.id))) : openaiError(res, 404, "assistant not found"));
+app.post("/v1/assistants/:id", (req, res) => {
+  const a = assistants.get(req.params.id);
+  if (!a) return openaiError(res, 404, "assistant not found");
+  Object.assign(a, req.body);
+  res.json(asstObject(a));
+});
+app.delete("/v1/assistants/:id", (req, res) =>
+  assistants.delete(req.params.id) ? res.json({ id: req.params.id, object: "assistant.deleted", deleted: true }) : openaiError(res, 404, "assistant not found"));
+
+const msgObject = (m) => ({
+  id: m.id, object: "thread.message", created_at: m.created_at, thread_id: m.thread_id,
+  status: "completed", role: m.role,
+  content: [{ type: "text", text: { value: m.text, annotations: [] } }],
+  attachments: [], metadata: m.metadata ?? {},
+});
+
+function newThread(body = {}) {
+  const t = { id: `thread_${crypto.randomBytes(12).toString("hex")}`, created_at: Math.floor(Date.now() / 1000), metadata: body.metadata ?? {}, tool_resources: body.tool_resources ?? {}, messages: [] };
+  for (const m of body.messages ?? []) {
+    t.messages.push({ id: `msg_${crypto.randomBytes(12).toString("hex")}`, created_at: Math.floor(Date.now() / 1000), thread_id: t.id, role: m.role ?? "user", text: typeof m.content === "string" ? m.content : (m.content ?? []).map((p) => p.text?.value ?? p.text ?? "").join("\n"), metadata: m.metadata ?? {} });
+  }
+  threads.set(t.id, t);
+  return t;
+}
+const threadObject = (t) => ({ id: t.id, object: "thread", created_at: t.created_at, metadata: t.metadata, tool_resources: t.tool_resources });
+
+app.post("/v1/threads", (req, res) => {
+  const t = newThread(req.body);
+  res.json({ ...threadObject(t) });
+});
+app.post("/v1/threads/runs", async (req, res) => {
+  // create-thread-and-run convenience endpoint
+  const t = newThread(req.body.thread);
+  const run = await startRun(t, req.body);
+  res.json(run);
+});
+app.get("/v1/threads/:id", (req, res) =>
+  threads.has(req.params.id) ? res.json(threadObject(threads.get(req.params.id))) : openaiError(res, 404, "thread not found"));
+app.post("/v1/threads/:id", (req, res) => {
+  const t = threads.get(req.params.id);
+  if (!t) return openaiError(res, 404, "thread not found");
+  Object.assign(t.metadata, req.body.metadata ?? {});
+  res.json(threadObject(t));
+});
+app.delete("/v1/threads/:id", (req, res) =>
+  threads.delete(req.params.id) ? res.json({ id: req.params.id, object: "thread.deleted", deleted: true }) : openaiError(res, 404, "thread not found"));
+
+app.post("/v1/threads/:id/messages", (req, res) => {
+  const t = threads.get(req.params.id);
+  if (!t) return openaiError(res, 404, "thread not found");
+  const m = { id: `msg_${crypto.randomBytes(12).toString("hex")}`, created_at: Math.floor(Date.now() / 1000), thread_id: t.id, role: req.body.role ?? "user", text: typeof req.body.content === "string" ? req.body.content : (req.body.content ?? []).map((p) => p.text?.value ?? p.text ?? "").join("\n"), metadata: req.body.metadata ?? {} };
+  t.messages.push(m);
+  res.json(msgObject(m));
+});
+app.get("/v1/threads/:id/messages", (req, res) => {
+  const t = threads.get(req.params.id);
+  if (!t) return openaiError(res, 404, "thread not found");
+  res.json({ object: "list", data: [...t.messages].reverse().map(msgObject), first_id: null, last_id: null, has_more: false });
+});
+app.get("/v1/threads/:id/messages/:mid", (req, res) => {
+  const t = threads.get(req.params.id);
+  const m = t?.messages.find((x) => x.id === req.params.mid);
+  if (!m) return openaiError(res, 404, "message not found");
+  res.json(msgObject(m));
+});
+
+async function startRun(t, body) {
+  const a = assistants.get(body.assistant_id);
+  if (!a) return { error: `assistant '${body.assistant_id}' not found` };
+  const r = {
+    id: `run_${crypto.randomBytes(12).toString("hex")}`, object: "thread.run",
+    created_at: Math.floor(Date.now() / 1000), thread_id: t.id, assistant_id: a.id,
+    status: "queued", model: a.model ?? DEVIN_MODEL, instructions: body.instructions ?? a.instructions ?? null,
+    tools: a.tools ?? [], metadata: body.metadata ?? {}, usage: null,
+    expires_at: Math.floor(Date.now() / 1000) + 600,
+  };
+  runs.set(r.id, r);
+  (async () => {
+    r.status = "in_progress";
+    try {
+      const msgs = [
+        ...(r.instructions ? [{ role: "system", content: r.instructions }] : []),
+        // New-thread run: full history; continuing run: only latest user turn
+        ...(t.messagesSent ? [{ role: t.messages.at(-1).role === "assistant" ? "user" : t.messages.at(-1).role, content: t.messages.at(-1).text }] : t.messages.map((m) => ({ role: m.role, content: m.text }))),
+      ];
+      const { text, usage } = await generateOne({ messages: msgs }, undefined, `thread:${t.id}`);
+      t.messagesSent = true;
+      const reply = { id: `msg_${crypto.randomBytes(12).toString("hex")}`, created_at: Math.floor(Date.now() / 1000), thread_id: t.id, role: "assistant", text: applyPostHoc(text, {}), metadata: {} };
+      t.messages.push(reply);
+      r.status = "completed";
+      r.completed_at = Math.floor(Date.now() / 1000);
+      if (usage) r.usage = { prompt_tokens: usage.inputTokens, completion_tokens: usage.outputTokens, total_tokens: usage.totalTokens };
+    } catch (e) {
+      r.status = "failed";
+      r.failed_at = Math.floor(Date.now() / 1000);
+      r.last_error = { code: "server_error", message: e.message };
+    }
+  })();
+  return r;
+}
+
+app.post("/v1/threads/:id/runs", async (req, res) => {
+  const t = threads.get(req.params.id);
+  if (!t) return openaiError(res, 404, "thread not found");
+  if (!t.messages.length) return openaiError(res, 400, "can't execute run without messages");
+  const r = await startRun(t, req.body);
+  if (r.error) return openaiError(res, 404, r.error);
+  res.json(r);
+});
+app.get("/v1/threads/:id/runs", (req, res) =>
+  res.json({ object: "list", data: [...runs.values()].filter((r) => r.thread_id === req.params.id), first_id: null, last_id: null, has_more: false }));
+app.get("/v1/threads/:id/runs/:rid", (req, res) => {
+  const r = runs.get(req.params.rid);
+  if (!r || r.thread_id !== req.params.id) return openaiError(res, 404, "run not found");
+  res.json(r);
+});
+app.post("/v1/threads/:id/runs/:rid/cancel", (req, res) => {
+  const r = runs.get(req.params.rid);
+  if (!r || r.thread_id !== req.params.id) return openaiError(res, 404, "run not found");
+  if (r.status === "queued" || r.status === "in_progress") r.status = "cancelling";
+  res.json(r);
+});
+app.get("/v1/threads/:id/runs/:rid/steps", (req, res) =>
+  res.json({ object: "list", data: [], first_id: null, last_id: null, has_more: false }));
+
+// ---------------------------------------------------------------------------
+// Conversations — trivial store backing the Responses `conversation` param.
+// ---------------------------------------------------------------------------
+const convs = new Map();
+const convObject = (c) => ({ id: c.id, object: "conversation", created_at: c.created_at, metadata: c.metadata });
+
+app.post("/v1/conversations", (req, res) => {
+  const c = { id: `conv_${crypto.randomBytes(12).toString("hex")}`, created_at: Math.floor(Date.now() / 1000), metadata: req.body?.metadata ?? {}, items: req.body?.items ?? [] };
+  convs.set(c.id, c);
+  res.json(convObject(c));
+});
+app.get("/v1/conversations/:id", (req, res) =>
+  convs.has(req.params.id) ? res.json(convObject(convs.get(req.params.id))) : openaiError(res, 404, "conversation not found"));
+app.post("/v1/conversations/:id", (req, res) => {
+  const c = convs.get(req.params.id);
+  if (!c) return openaiError(res, 404, "conversation not found");
+  Object.assign(c.metadata, req.body.metadata ?? {});
+  res.json(convObject(c));
+});
+app.delete("/v1/conversations/:id", (req, res) =>
+  convs.delete(req.params.id) ? res.json({ id: req.params.id, object: "conversation.deleted", deleted: true }) : openaiError(res, 404, "conversation not found"));
+app.get("/v1/conversations/:id/items", (req, res) => {
+  const c = convs.get(req.params.id);
+  if (!c) return openaiError(res, 404, "conversation not found");
+  res.json({ object: "list", data: c.items, first_id: null, last_id: null, has_more: false });
+});
+app.post("/v1/conversations/:id/items", (req, res) => {
+  const c = convs.get(req.params.id);
+  if (!c) return openaiError(res, 404, "conversation not found");
+  c.items.push(...(req.body.items ?? []));
+  res.json({ object: "list", data: req.body.items ?? [], first_id: null, last_id: null, has_more: false });
+});
+
+// ---------------------------------------------------------------------------
+// Embeddings — passthrough proxy. Devin exposes no embedding model; when
+// EMBEDDINGS_UPSTREAM is set (any OpenAI-compatible endpoint, e.g. Ollama
+// :11434/v1), requests proxy there verbatim. Otherwise honest 501.
+// ---------------------------------------------------------------------------
+const EMB_UPSTREAM = process.env.EMBEDDINGS_UPSTREAM ?? null;
+const EMB_KEY = process.env.EMBEDDINGS_KEY ?? null;
+
+app.post("/v1/embeddings", async (req, res) => {
+  if (!EMB_UPSTREAM) {
+    return openaiError(res, 501, "embeddings requires EMBEDDINGS_UPSTREAM (an OpenAI-compatible embeddings endpoint) — the Devin CLI exposes no embedding model", "unsupported_endpoint");
+  }
+  try {
+    const r = await fetch(`${EMB_UPSTREAM}/embeddings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(EMB_KEY ? { Authorization: `Bearer ${EMB_KEY}` } : {}) },
+      body: JSON.stringify(req.body ?? {}),
+      signal: AbortSignal.timeout(60_000),
+    });
+    res.status(r.status).json(await r.json());
+  } catch (e) {
+    openaiError(res, 502, `embeddings upstream failed: ${e.message}`, "upstream_error");
+  }
+});
+
+// Remaining surface: explicit 501 instead of silent 404. These need
+// infrastructure the backend doesn't have (audio models, training, websockets).
 for (const p of [
-  "/v1/embeddings", "/v1/images/:rest", "/v1/audio/:rest",
-  "/v1/files", "/v1/files/:id", "/v1/fine_tuning/:rest", "/v1/batches",
-  "/v1/moderations", "/v1/assistants", "/v1/threads",
+  "/v1/audio/:rest", "/v1/fine_tuning/:rest", "/v1/vector_stores/:rest",
+  "/v1/uploads/:rest", "/v1/realtime/:rest", "/v1/videos/:rest",
+  "/v1/evals/:rest", "/v1/containers/:rest", "/v1/images/edits", "/v1/images/variations",
 ]) {
   app.all(p, unsupported(p));
 }

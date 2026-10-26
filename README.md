@@ -67,7 +67,26 @@ npm start          # http://127.0.0.1:8787
 | GET  | `/v1/models` · `/v1/models/:id` | Lists the configured model |
 | GET  | `/v1/catalog` | **Public (no auth)** — full account model catalog |
 | GET  | `/health` | Transport, queue, live session count |
-| ANY  | other `/v1/*` (embeddings, images, files…) | Explicit `501 unsupported_endpoint` |
+| **Files** |||
+| POST | `/v1/files` | Real local storage (`.data/files/`); multipart or JSON base64 |
+| GET/DELETE | `/v1/files` · `/v1/files/:id` · `/v1/files/:id/content` | List, meta, raw content, delete |
+| **Batches** |||
+| POST/GET | `/v1/batches` · `/v1/batches/:id` · `/:id/cancel` | Real async JSONL processing over chat-completions/responses; output written to a `file-*` |
+| **Moderation** |||
+| POST | `/v1/moderations` | LLM-emulated classifier; full omni category set |
+| **Images** |||
+| POST | `/v1/images/generations` | Emulated — the model writes **SVG**; `b64_json` or `url` (served from shim, localhost only) |
+| **Assistants (v2 shape)** |||
+| POST/GET/DELETE | `/v1/assistants`, `/v1/threads`, `/v1/threads/:id/messages`, `/v1/threads/:id/runs`, `/v1/threads/runs` | In-memory stores; runs execute on the agent keyed by `thread:<id>` (persistent session); `runs/:id/steps` returns `[]` |
+| **Conversations** |||
+| POST/GET/DELETE | `/v1/conversations`, `/:id`, `/:id/items` | Trivial item store |
+| **Embeddings** |||
+| POST | `/v1/embeddings` | Passthrough proxy — requires `EMBEDDINGS_UPSTREAM` env (any OpenAI-compatible endpoint); else `501` — the CLI has no embedding model |
+| **501s (backend can't do it)** |||
+| ANY | `/v1/audio/*`, `/v1/realtime/*` | `promptCapabilities.audio: false` |
+| ANY | `/v1/fine_tuning/*`, `/v1/evals/*` | No training surface in the CLI |
+| ANY | `/v1/vector_stores/*` | Needs real embeddings |
+| ANY | `/v1/uploads/*`, `/v1/containers/*`, `/v1/videos/*`, `/v1/images/edits`, `/v1/images/variations` | Not implemented / no backend |
 
 ### `POST /v1/responses`
 
@@ -151,6 +170,7 @@ unless `SHIM_API_KEY` is set — when set it guards **all** routes, including
 | `DEVIN_TIMEOUT_MS` | `480000` | Per-request timeout |
 | `SESSION_TTL_MS` | `1800000` | Idle conversation eviction |
 | `DEVIN_BIN` | per-OS default | Override devin binary location |
+| `EMBEDDINGS_UPSTREAM` / `EMBEDDINGS_KEY` | unset | Point `/v1/embeddings` at any OpenAI-compatible endpoint (e.g. Ollama `http://127.0.0.1:11434/v1`) |
 
 ## Token & cost optimization
 
