@@ -63,10 +63,30 @@ npm start          # http://127.0.0.1:8787
 | Method | Path | Notes |
 |--------|------|-------|
 | POST | `/v1/chat/completions` | Full request surface; see compat matrix |
+| POST | `/v1/responses` | Responses API subset; see below |
 | GET  | `/v1/models` · `/v1/models/:id` | Lists the configured model |
 | GET  | `/v1/catalog` | **Public (no auth)** — full account model catalog |
 | GET  | `/health` | Transport, queue, live session count |
 | ANY  | other `/v1/*` (embeddings, images, files…) | Explicit `501 unsupported_endpoint` |
+
+### `POST /v1/responses`
+
+Supported request fields: `model` (validated), `instructions` → system
+message, `input` (string, chat-style `{role,content}` items, or Responses
+items: `message`, `function_call`, `function_call_output`), `tools` /
+`tool_choice` (same prompt-injected emulation as chat; flat
+`{type:"function", name, ...}` entries are normalized), `max_output_tokens`
+→ output cap, `previous_response_id` → resumes the prior turn's agent
+session (real multi-turn on the `acp` transport), `stream`, `store`,
+`metadata`, `text.format: json_object|json_schema`, `user` /
+`x-session-id`.
+
+Streaming emits the standard event sequence: `response.created` →
+`response.in_progress` → `output_item.added` → `content_part.added` →
+`output_text.delta`×N → `output_text.done` → `content_part.done` →
+`output_item.done` → `response.completed` (no `[DONE]` sentinel, matching
+the Responses spec). Function calls emit
+`response.function_call_arguments.done` + a `function_call` output item.
 
 ### `GET /v1/catalog` — public
 
@@ -98,6 +118,7 @@ currently served (`served: true`). Each entry carries `free`,
 | `stream_options.include_usage` | ✅ emits usage chunk before `[DONE]` (estimated counts) |
 | `response_format: json_object` | ✅ prompt-enforced + JSON-only reply |
 | `tools` / `tool_choice` | ⚠️ **emulated** — described in prompt, model replies `{"tool_call":{...}}` → mapped to OpenAI `tool_calls`; object form `{"type":"function",...}` forces that function |
+| `functions` / `function_call` (legacy) | ✅ normalized to `tools` / `tool_choice` |
 | CORS | ✅ `Access-Control-Allow-Origin: *` + `OPTIONS` preflight |
 | SSE heartbeat | ✅ `: hb` comment every 15 s during generation |
 | `temperature`, `top_p`, penalties, `seed`, `logprobs` | ❌ accepted, ignored — the CLI exposes no sampling controls |

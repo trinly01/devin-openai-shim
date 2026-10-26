@@ -5,8 +5,15 @@ description: Run, test, and modify the OpenAI-compatible API shim over the Devin
 
 # devin-openai-shim
 
-Local OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`, `/health`)
-backed by the Devin CLI running respond-only on SWE-2.
+Local OpenAI-compatible API (`/v1/chat/completions`, `/v1/responses`,
+`/v1/models`, `/v1/catalog`, `/health`) backed by the Devin CLI running
+respond-only on SWE-2.
+
+`/v1/responses` supports `instructions`, string/item-array `input`,
+function tools, `previous_response_id` → resumes the same agent session
+(real multi-turn), `stream` with the standard Responses event sequence,
+`store`/`metadata` passthrough. Legacy `functions`/`function_call` params
+normalize to `tools`/`tool_choice` in both endpoints.
 
 ## How it works
 

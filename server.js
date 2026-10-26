@@ -321,7 +321,7 @@ async function acpChat(convKey, messages, onChunk) {
     if (!s.sessionId) s.sessionId = await acp.newSession();
     // ACP sessions keep context — send only the new user turn if the session
     // already has history, else the flattened transcript.
-    const text = s.hasHistory ? lastUserText(messages) : flattenMessages(messages);
+    const text = s.hasHistory ? (lastUserText(messages) || flattenMessages(messages)) : flattenMessages(messages);
     let acc = "";
     try {
       await acp.prompt(s.sessionId, text, (t) => { acc += t; onChunk?.(t); });
@@ -362,7 +362,7 @@ app.use((req, res, next) => {
   if (!API_KEY || req.path === "/v1/catalog") return next(); // catalog is public
   const token = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
   if (token.length !== API_KEY.length || !crypto.timingSafeEqual(Buffer.from(token), Buffer.from(API_KEY))) {
-    return res.status(401).json({ error: { message: "invalid api key", type: "invalid_request_error" } });
+    return res.status(401).json({ error: { message: "invalid api key", type: "invalid_request_error", param: null, code: "invalid_api_key" } });
   }
   next();
 });
@@ -388,6 +388,19 @@ function buildChoice(text, body, index = 0) {
   };
 }
 
+// Legacy `functions`/`function_call` params → normalize to tools/tool_choice.
+function normalizeLegacyTools(body) {
+  if (!body.tools?.length && body.functions?.length) {
+    body.tools = body.functions.map((f) => ({ type: "function", function: f }));
+  }
+  if (body.tool_choice == null && body.function_call != null) {
+    const fc = body.function_call;
+    body.tool_choice = typeof fc === "object" ? { type: "function", function: { name: fc.name } }
+      : fc === "none" || fc === "auto" ? fc
+      : { type: "function", function: { name: fc } };
+  }
+}
+
 async function generateOne(body, onChunk, convKeyOverride) {
   const convKey = convKeyOverride ?? body.user ?? body.__sessionHeader ?? crypto.randomUUID();
   const msgs = [...(body.messages ?? [])];
@@ -409,6 +422,7 @@ app.post("/v1/chat/completions", async (req, res) => {
   if (body.model && body.model !== DEVIN_MODEL) {
     return openaiError(res, 404, `model '${body.model}' not found (shim serves '${DEVIN_MODEL}')`, "model_not_found");
   }
+  normalizeLegacyTools(body);
   const n = Math.min(Math.max(body.n ?? 1, 1), 4); // cap: each choice = one agent run
 
   let heartbeat = null;
@@ -465,6 +479,137 @@ app.post("/v1/chat/completions", async (req, res) => {
         get total_tokens() { return this.prompt_tokens + this.completion_tokens; },
       },
     });
+  } catch (e) {
+    if (heartbeat) clearInterval(heartbeat);
+    if (res.headersSent) return res.end();
+    openaiError(res, 502, e.message, "upstream_error");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /v1/responses — OpenAI Responses API (default surface of newer SDKs).
+// Supported: instructions, string|item-array input, function tools +
+// tool_choice, previous_response_id chaining, max_output_tokens, stream with
+// the standard event sequence, store/metadata passthrough, text.format.
+// ---------------------------------------------------------------------------
+
+const respStore = new Map(); // resp_id -> conversation key (previous_response_id)
+
+function responsesInputToMessages(input) {
+  if (typeof input === "string") return [{ role: "user", content: input }];
+  const msgs = [];
+  for (const it of input ?? []) {
+    if (it.role && it.type === undefined) { // plain chat-style {role, content}
+      msgs.push({ role: it.role, content: it.content });
+      continue;
+    }
+    if (it.type === "message") {
+      const parts = Array.isArray(it.content) ? it.content : [{ text: String(it.content) }];
+      msgs.push({ role: it.role ?? "user", content: parts.map((p) => p.text ?? "").join("\n") });
+    } else if (it.type === "function_call") {
+      msgs.push({ role: "assistant", content: "", tool_calls: [{ id: it.call_id, type: "function", function: { name: it.name, arguments: it.arguments } }] });
+    } else if (it.type === "function_call_output") {
+      msgs.push({ role: "tool", content: typeof it.output === "string" ? it.output : JSON.stringify(it.output) });
+    }
+    // reasoning/web_search_call/etc. items carry no text — skipped
+  }
+  return msgs;
+}
+
+const rid = (p) => `${p}_${crypto.randomBytes(12).toString("hex")}`;
+
+function buildResponse(id, text, body, status = "completed") {
+  const toolCall = body.tools?.length ? parseToolCall(text, body.tools) : null;
+  const clean = toolCall ? "" : applyPostHoc(text, body);
+  const output = toolCall
+    ? [{ type: "function_call", id: rid("fc"), call_id: toolCall.id, name: toolCall.function.name, arguments: toolCall.function.arguments, status: "completed" }]
+    : [{ id: rid("msg"), type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: clean, annotations: [] }] }];
+  const it = estimateTokens(JSON.stringify(body.messages));
+  const ot = estimateTokens(toolCall ? toolCall.function.arguments : clean);
+  return {
+    id, object: "response", created_at: Math.floor(Date.now() / 1000), status,
+    model: DEVIN_MODEL, output, output_text: clean,
+    usage: { input_tokens: it, output_tokens: ot, total_tokens: it + ot },
+    store: body.store ?? true, metadata: body.metadata ?? {},
+    previous_response_id: body.previous_response_id ?? null,
+  };
+}
+
+app.post("/v1/responses", async (req, res) => {
+  const body = req.body ?? {};
+  if (body.model && body.model !== DEVIN_MODEL) {
+    return openaiError(res, 404, `model '${body.model}' not found (shim serves '${DEVIN_MODEL}')`, "model_not_found");
+  }
+  if (body.input === undefined || body.input === null) {
+    return openaiError(res, 400, "input is required");
+  }
+  let convKey;
+  if (body.previous_response_id) {
+    convKey = respStore.get(body.previous_response_id);
+    if (!convKey) return openaiError(res, 400, `previous_response_id '${body.previous_response_id}' not found`);
+  } else {
+    convKey = `resp:${body.user ?? req.headers["x-session-id"] ?? crypto.randomUUID()}`;
+  }
+
+  const normBody = {
+    messages: [
+      ...(body.instructions ? [{ role: "system", content: body.instructions }] : []),
+      ...responsesInputToMessages(body.input),
+    ],
+    tools: (body.tools ?? []).map((t) =>
+      t.type === "function" && !t.function
+        ? { type: "function", function: { name: t.name, description: t.description, parameters: t.parameters, strict: t.strict } }
+        : t),
+    tool_choice: body.tool_choice,
+    max_tokens: body.max_output_tokens,
+    user: body.user,
+    previous_response_id: body.previous_response_id ?? null,
+    store: body.store,
+    metadata: body.metadata,
+    response_format: body.text?.format?.type === "json_object" || body.text?.format?.type === "json_schema"
+      ? { type: "json_object" } : undefined,
+  };
+  if (!normBody.messages.length) return openaiError(res, 400, "input produced no messages");
+
+  const respId = rid("resp");
+  let heartbeat = null;
+  try {
+    if (body.stream) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      const ev = (type, payload) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`);
+      const msgId = rid("msg"), part = { type: "output_text", text: "", annotations: [] };
+      const item = { id: msgId, type: "message", status: "in_progress", role: "assistant", content: [] };
+
+      ev("response.created", { response: { ...buildResponse(respId, "", normBody, "in_progress"), output: [] } });
+      ev("response.in_progress", { response: { id: respId, status: "in_progress" } });
+      ev("response.output_item.added", { output_index: 0, item });
+      ev("response.content_part.added", { item_id: msgId, output_index: 0, content_index: 0, part });
+      heartbeat = setInterval(() => res.write(": hb\n\n"), 15000);
+      const text = await generateOne(normBody, (t) => ev("response.output_text.delta", { item_id: msgId, output_index: 0, content_index: 0, delta: t }), convKey);
+      clearInterval(heartbeat);
+
+      const final = buildResponse(respId, text, normBody);
+      if (final.output[0].type === "function_call") {
+        const fc = final.output[0];
+        ev("response.output_item.added", { output_index: 0, item: { ...fc, status: "in_progress" } });
+        ev("response.function_call_arguments.done", { item_id: fc.id, output_index: 0, arguments: fc.arguments });
+        ev("response.output_item.done", { output_index: 0, item: fc });
+      } else {
+        ev("response.output_text.done", { item_id: msgId, output_index: 0, content_index: 0, text: final.output_text });
+        ev("response.content_part.done", { item_id: msgId, output_index: 0, content_index: 0, part: { ...part, text: final.output_text } });
+        ev("response.output_item.done", { output_index: 0, item: { ...item, status: "completed", content: [{ ...part, text: final.output_text }] } });
+      }
+      ev("response.completed", { response: final });
+      respStore.set(respId, convKey);
+      return res.end();
+    }
+
+    const text = await generateOne(normBody, undefined, convKey);
+    const final = buildResponse(respId, text, normBody);
+    respStore.set(respId, convKey);
+    res.json(final);
   } catch (e) {
     if (heartbeat) clearInterval(heartbeat);
     if (res.headersSent) return res.end();
@@ -566,7 +711,7 @@ app.get("/health", (_req, res) =>
 
 // Everything else in the OpenAI surface: explicit 501 instead of silent 404.
 for (const p of [
-  "/v1/responses", "/v1/embeddings", "/v1/images/:rest", "/v1/audio/:rest",
+  "/v1/embeddings", "/v1/images/:rest", "/v1/audio/:rest",
   "/v1/files", "/v1/files/:id", "/v1/fine_tuning/:rest", "/v1/batches",
   "/v1/moderations", "/v1/assistants", "/v1/threads",
 ]) {
