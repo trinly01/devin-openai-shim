@@ -26,10 +26,12 @@ normalize to `tools`/`tool_choice` in both endpoints.
 - Fallback transport `TRANSPORT=print` spawns `devin -p` per request
   (stateless, single-chunk stream, history flattened into the prompt).
 - `SHIM_CONFIG` selects the permission profile passed via `--config`:
-  `safe` (default, `devin-safe.json`) denies local `exec`/`edit`/`Write(**)`/
-  `Fetch(*)` but **allows `mcp__*`** — the agent can act on remote systems
-  that have an MCP server in the Devin CLI config (verified: Atlassian MCP
-  call returned real data). `readonly` (`devin-readonly.json`) also denies
+  `safe` (default, `devin-safe.json`) denies local `exec`/`edit`/`Write(**)`
+  but **allows remote tools**: `mcp__*` (MCP servers in the CLI config —
+  verified: Atlassian call returned real data) plus `web_search`/`webfetch`/
+  `fetch`/`browser*` (verified: live web search). `readonly` also denies
+  all of these — pure respond-only, no side effects anywhere.
+  `Fetch(*)` moved from deny to allow in safe mode to permit browsing.
   `mcp__*`. The ACP layer additionally refuses every agent→client request
   (`fs/*`, `terminal/*`, `session/request_permission` → cancelled). Local
   machine stays read-only in both profiles — do not weaken either layer.

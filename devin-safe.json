@@ -3,15 +3,20 @@
     "deny": [
       "exec",
       "edit",
-      "Write(**)",
-      "Fetch(*)"
+      "Write(**)"
     ],
     "allow": [
       "read",
       "grep",
       "glob",
       "Read(**)",
-      "mcp__*"
+      "mcp__*",
+      "web_search",
+      "webfetch",
+      "fetch",
+      "Fetch(*)",
+      "browser",
+      "browser_*"
     ]
   },
   "version": 1

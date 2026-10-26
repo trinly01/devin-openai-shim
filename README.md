@@ -173,7 +173,7 @@ and `/v1/images/serve/*` (unguessable IDs for generated images).
 | `EMBEDDINGS_UPSTREAM` / `EMBEDDINGS_KEY` | unset | Point `/v1/embeddings` at any OpenAI-compatible endpoint (e.g. Ollama `http://127.0.0.1:11434/v1`) |
 | `ACP_MODE` | `smart` | Agent persona. `smart` exposes tools incl. MCP; `ask` = Q&A-only (no tools); `accept-edits`/`plan`/`bypass` = coding modes |
 | `ACP_CWD` | `%TEMP%/devin-shim-workspace` | Workspace root given to sessions. Neutral default so the agent doesn't greet "in &lt;repo&gt;" |
-| `SHIM_CONFIG` | `safe` | Permission profile: `safe` = local read-only + MCP allowed; `readonly` = also denies `mcp__*` |
+| `SHIM_CONFIG` | `safe` | Permission profile: `safe` = local read-only + remote tools allowed (MCP, web_search, fetch/browse); `readonly` = denies those too |
 
 ## Token & cost optimization
 
