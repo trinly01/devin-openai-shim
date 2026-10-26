@@ -52,7 +52,7 @@ normalize to `tools`/`tool_choice` in both endpoints.
 ```bash
 npm install
 npm start                                # http://127.0.0.1:8787
-K=5137ffcfd7d937840e479851382c3de9e443b89b7f503c52   # SHIM_API_KEY from .env
+K=$(sed -n 's/^SHIM_API_KEY_MAIN=//p' .env | tr -d '\r')   # key from .env
 curl http://127.0.0.1:8787/health -H "Authorization: Bearer $K"   # smoke test
 curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer $K" -H "Content-Type: application/json" \

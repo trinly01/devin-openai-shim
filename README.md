@@ -154,9 +154,9 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"explain what a monad is"}]}'
 ```
 
-Point any OpenAI client at `http://127.0.0.1:8787/v1` (any API key string
-unless `SHIM_API_KEY` is set — when set it guards **all** routes, including
-`/health`).
+Point any OpenAI client at `http://127.0.0.1:8787/v1`. When `SHIM_API_KEY` is
+set it guards every route **except** `/v1/catalog` (public model metadata)
+and `/v1/images/serve/*` (unguessable IDs for generated images).
 
 ## Configuration (env vars)
 
