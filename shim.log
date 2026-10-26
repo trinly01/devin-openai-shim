@@ -1,0 +1,6 @@
+
+> devin-openai-shim@0.1.0 start
+> node --env-file-if-exists=.env server.js
+
+devin-openai-shim listening on http://127.0.0.1:8787
+model: swe-2-high | transport: acp | concurrency: 2 | auth: on

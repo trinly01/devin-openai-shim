@@ -86,6 +86,19 @@ configured `DEVIN_MODEL`. Only `swe-2-{high,medium,max}` are `cost_tier:
 "Free"`; everything else bills credits. `served: true` marks the model the
 shim actually runs.
 
+## Token optimization
+
+- The CLI already does async compaction (`DEVIN_COMPACTION_THRESHOLDS` =
+  `<spawn>,<apply>,<hard>` absolute token counts; `SIDEKICK_*` for fusion)
+  and prompt caching internally — both tunable via env passthrough to the
+  spawned child.
+- The shim's own lever: conversation keys (`user` / `x-session-id` /
+  `previous_response_id`) keep ACP sessions alive so only the new turn is
+  sent. Stateless calls re-send flattened history — inherent to the OpenAI
+  model, mitigated only by session reuse.
+- `TRANSPORT=print` resends the full transcript per call; avoid for
+  multi-turn workloads.
+
 ## Verified clients
 
 Confirmed working end-to-end (chat + SSE streaming, 2026-10-26):

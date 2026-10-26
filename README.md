@@ -150,6 +150,33 @@ unless `SHIM_API_KEY` is set — when set it guards **all** routes, including
 | `SESSION_TTL_MS` | `1800000` | Idle conversation eviction |
 | `DEVIN_BIN` | per-OS default | Override devin binary location |
 
+## Token & cost optimization
+
+The Devin CLI handles compaction (async summarization with
+`<spawn>,<apply>,<hard>` token thresholds) and provider prompt caching
+internally — the shim's lever is *how much gets sent per turn*:
+
+- **Always send `user` or `x-session-id`.** With a stable conversation key
+  the `acp` transport keeps history inside the agent session and only the
+  new turn is transmitted — this is the dominant saving on long
+  conversations. Without a key, every call is a fresh session and the whole
+  `messages` array is replayed as prompt text.
+- **`previous_response_id`** on `/v1/responses` does the same for
+  Responses-API clients.
+- **`TRANSPORT=print` is expensive** — it flattens full history into every
+  spawned prompt. Use `acp` (default) for anything multi-turn.
+- **Keep the system prompt stable and first.** Reordering or rewording the
+  preamble breaks provider prompt-cache hits.
+- **Cap output** with `max_tokens`/`max_completion_tokens`/`max_output_tokens`;
+  avoid `n > 1` (each choice is a full agent run).
+- **Pick the model by cost_tier** via `/v1/catalog` — only `swe-2-*` is
+  `Free`; everything else bills.
+- **Tunables pass through to the CLI env**: `DEVIN_COMPACTION_THRESHOLDS`,
+  `SIDEKICK_COMPACTION_THRESHOLDS`, `DEVIN_REFUSAL_FALLBACK`, `DEVIN_MODEL`.
+  Lower compaction thresholds = earlier summarization = cheaper long turns.
+- `usage` fields are estimates (~4 chars/token) — the CLI reports real
+  counts internally but doesn't expose them over ACP.
+
 ## Limitations
 
 - No sampling controls exist on the backend — `temperature` etc. are no-ops.
