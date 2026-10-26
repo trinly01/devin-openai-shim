@@ -51,7 +51,7 @@ Two transports, selected by `TRANSPORT`:
 
 | `acp` (default) | `print` |
 |---|---|
-| One long-lived `devin acp` process (JSON-RPC/stdio) | Spawns `devin -p` per request |
+| One long-lived `devin acp` process **per model** (JSON-RPC/stdio) | Spawns `devin -p` per request |
 | Real streamed chunks | Single-chunk SSE (fake streaming) |
 | Persistent sessions → real multi-turn | Stateless; history replayed as text |
 | Recovers sessions after process restart | — |
@@ -75,8 +75,8 @@ without it.
 |--------|------|-------|
 | POST | `/v1/chat/completions` | Full request surface; see compat matrix |
 | POST | `/v1/responses` | Responses API subset; see below |
-| GET  | `/v1/models` · `/v1/models/:id` | Lists the configured model |
-| GET  | `/v1/catalog` | **Public (no auth)** — full account model catalog |
+| GET  | `/v1/models` · `/v1/models/:id` | Full account catalog, OpenAI shape |
+| GET  | `/v1/catalog` | **Public (no auth)** — free models only without a key; a valid Bearer key reveals paid tiers too |
 | GET  | `/health` | Transport, queue, live session count |
 | **Files** |||
 | POST | `/v1/files` | Real local storage (`.data/files/`); multipart or JSON base64 |
@@ -129,16 +129,19 @@ combine (AND):
 | `tier` | `free` · `low` · `med` · `high` — matches `cost_tier` |
 | `q` | substring match on model id / label / family |
 
-`recommended` is a shim-side heuristic: `cost_tier == "Free"` or the model
-currently served (`served: true`). Each entry carries `free`,
-`recommended`, `cost_tier`, `cost_summary`, `context_tokens`, `is_new`,
-`is_beta`, `aliases`, `family`.
+`recommended` is a shim-side heuristic: `cost_tier == "Free"` or the
+configured default (`default: true` → `DEVIN_MODEL`). Each entry carries
+`free`, `recommended`, `cost_tier`, `cost_summary`, `context_tokens`,
+`is_new`, `is_beta`, `aliases`, `family`. `served: true` on every entry —
+any catalog model can be requested (each gets its own `devin acp` process
+on first use). The response's `authenticated` flag tells whether the full
+or free-only view was served; unauthenticated `?filter=paid` is a 401.
 
 ## Request compatibility
 
 | Param | Behavior |
 |-------|----------|
-| `model` | ✅ validated — must equal `DEVIN_MODEL`, else `404 model_not_found` |
+| `model` | ✅ any catalog model — validated against `devin models list`, else `404 model_not_found`; `DEVIN_MODEL` when omitted |
 | `messages` | ✅ full roles incl. `tool` results |
 | `content[]` `image_url` | ✅ data: URLs + http(s) fetch (acp); → ACP `image` blocks |
 | `content[]` `file` / `input_file` | ✅ text/* base64 inlined (acp) |
@@ -173,7 +176,7 @@ and `/v1/images/serve/*` (unguessable IDs for generated images).
 
 | Var | Default | Purpose |
 |-----|---------|---------|
-| `DEVIN_MODEL` | `swe-2-high` | Model passed to `devin --model` |
+| `DEVIN_MODEL` | `swe-2-high` | Default model when requests omit `model`; any catalog model is servable per-request (one `devin acp` process each, spawned lazily) |
 | `TRANSPORT` | `acp` | `acp` (persistent, streaming) or `print` (spawn per call) |
 | `PORT` / `HOST` | `8787` / `127.0.0.1` | Bind address (keep localhost) |
 | `SHIM_API_KEY` | unset (open) | If set, required as `Authorization: Bearer`. Multi-key: comma-separated `name:key` pairs, or one per line via `SHIM_API_KEY_<NAME>=<secret>` (both combine). Per-key usage at `GET /v1/access`; one `[access]` line per request, denials logged |

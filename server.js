@@ -298,13 +298,13 @@ const estimateTokens = (s) => Math.ceil((s ?? "").length / 4);
 // Print transport: spawn `devin -p` per call. Stateless, no streaming.
 // ---------------------------------------------------------------------------
 
-function runDevinPrint(prompt) {
+function runDevinPrint(prompt, model = DEVIN_MODEL) {
   return withSlot(
     () =>
       new Promise((resolve, reject) => {
         const args = [
           "-p", prompt,
-          "--model", DEVIN_MODEL,
+          "--model", model,
           "--config", READONLY_CONFIG,
           "--respect-workspace-trust", "false",
         ];
@@ -337,7 +337,8 @@ function runDevinPrint(prompt) {
 // ---------------------------------------------------------------------------
 
 class AcpClient {
-  constructor() {
+  constructor(model) {
+    this.model = model;
     this.proc = null;
     this.nextId = 1;
     this.pending = new Map(); // id -> {resolve, reject}
@@ -349,7 +350,7 @@ class AcpClient {
     if (this.proc && !this.proc.killed) return this.ready;
     this.proc = spawn(
       DEVIN_BIN,
-      ["--config", READONLY_CONFIG, "acp", "--model", DEVIN_MODEL],
+      ["--config", READONLY_CONFIG, "acp", "--model", this.model],
       { cwd: __dirname, windowsHide: true, stdio: ["pipe", "pipe", "inherit"], env: CHILD_ENV, shell: DEVIN_NEEDS_SHELL },
     );
     const rl = readline.createInterface({ input: this.proc.stdout });
@@ -451,7 +452,15 @@ class AcpClient {
   }
 }
 
-const acp = new AcpClient();
+// One `devin acp` process per requested model — the CLI pins --model at
+// spawn, so per-request model selection = a process pool. Lazily created on
+// first use; each process carries its own sessions.
+const acpClients = new Map(); // model -> AcpClient
+function acpFor(model) {
+  let c = acpClients.get(model);
+  if (!c) { c = new AcpClient(model); acpClients.set(model, c); }
+  return c;
+}
 
 // ---------------------------------------------------------------------------
 // Auth recovery: when a spawned CLI reports "Not logged in", pop a real
@@ -494,6 +503,23 @@ function authRemedy(e) {
     : e.message;
 }
 
+// Request `model` -> a servable model id. Any model in the account catalog is
+// accepted (each gets its own `devin acp` process); unknown ids are a 404.
+// When the catalog itself is unreachable only DEVIN_MODEL is servable — it's
+// the one model whose existence doesn't depend on a successful models list.
+async function resolveModel(requested) {
+  if (!requested || requested === DEVIN_MODEL) return { model: requested || DEVIN_MODEL };
+  try {
+    const { data } = await getCatalog();
+    for (const fam of data.families ?? [])
+      for (const v of fam.variants ?? [])
+        if (v.model_uid === requested) return { model: requested };
+    return { error: `model '${requested}' not found — see GET /v1/catalog for available models (default '${DEVIN_MODEL}')` };
+  } catch {
+    return { error: `model '${requested}' can't be verified (catalog unavailable); only '${DEVIN_MODEL}' is servable` };
+  }
+}
+
 // Conversation -> ACP session map. `user` field (or x-session-id header) is
 // the conversation key; without one, every call gets a fresh session and the
 // full history is replayed as prompt text.
@@ -512,18 +538,19 @@ setInterval(() => {
   for (const [k, s] of sessions) if (s.touched < cutoff) sessions.delete(k);
 }, 60_000).unref();
 
-async function acpChat(convKey, messages, onChunk) {
-  const s = getSession(convKey);
+async function acpChat(model, convKey, messages, onChunk) {
+  const s = getSession(`${model}\n${convKey}`);
+  const client = acpFor(model);
   // Serialize prompts per conversation.
   const prev = s.busy ?? Promise.resolve();
   const job = prev.catch(() => {}).then(async () => {
-    if (!s.sessionId) s.sessionId = await acp.newSession();
+    if (!s.sessionId) s.sessionId = await client.newSession();
     // ACP sessions keep context — send only the new user turn if the session
     // already has history, else the flattened transcript.
     const blocks = s.hasHistory ? (await lastUserBlocks(messages) ?? await messagesToBlocks(messages)) : await messagesToBlocks(messages);
     let acc = "";
     try {
-      const r = await acp.prompt(s.sessionId, blocks, (t) => { acc += t; onChunk?.(t); });
+      const r = await client.prompt(s.sessionId, blocks, (t) => { acc += t; onChunk?.(t); });
       s.hasHistory = true;
       return { text: acc, usage: r?.usage ?? null };
     } catch (e) {
@@ -531,10 +558,10 @@ async function acpChat(convKey, messages, onChunk) {
       // login window and fail fast instead of a pointless replay.
       if (isAuthError(e)) throw new Error(authRemedy(e));
       // Session may have died with a restarted acp process — recreate once.
-      s.sessionId = await acp.newSession();
+      s.sessionId = await client.newSession();
       s.hasHistory = false;
       acc = "";
-      const r = await acp.prompt(s.sessionId, await messagesToBlocks(messages), (t) => { acc += t; onChunk?.(t); });
+      const r = await client.prompt(s.sessionId, await messagesToBlocks(messages), (t) => { acc += t; onChunk?.(t); });
       s.hasHistory = true;
       return { text: acc, usage: r?.usage ?? null };
     }
@@ -578,16 +605,22 @@ function recordAccess(label, req) {
   }
 }
 
-app.use((req, res, next) => {
-  // Public routes: catalog is metadata; images/serve uses unguessable IDs and
-  // the clients fetching it never send Authorization.
-  if (!API_KEYS.size || req.path === "/v1/catalog" || req.path.startsWith("/v1/images/serve/")) return next();
+// Returns the configured key's label when the request carries a valid
+// `Authorization: Bearer` key, else null. Used both for hard auth gating and
+// for catalog's free-vs-paid visibility split.
+function keyLabel(req) {
   const token = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
   const tb = Buffer.from(token);
-  let label = null;
-  for (const [k, l] of API_KEYS) {
-    if (tb.length === k.length && crypto.timingSafeEqual(tb, Buffer.from(k))) { label = l; break; }
-  }
+  for (const [k, l] of API_KEYS)
+    if (tb.length === k.length && crypto.timingSafeEqual(tb, Buffer.from(k))) return l;
+  return null;
+}
+
+app.use((req, res, next) => {
+  // Public routes: catalog is metadata (free models only without a key);
+  // images/serve uses unguessable IDs and those clients never send auth.
+  if (!API_KEYS.size || req.path === "/v1/catalog" || req.path.startsWith("/v1/images/serve/")) return next();
+  const label = keyLabel(req);
   if (!label) {
     if (!SKIP_LOG.has(req.path)) console.log(`[access] ${new Date().toISOString()} DENIED ${req.method} ${req.path} ip=${req.ip}`);
     return res.status(401).json({ error: { message: "invalid api key", type: "invalid_request_error", param: null, code: "invalid_api_key" } });
@@ -631,6 +664,8 @@ function normalizeLegacyTools(body) {
 }
 
 async function generateOne(body, onChunk, convKeyOverride) {
+  const { model, error } = await resolveModel(body.model);
+  if (error) throw new Error(error);
   const convKey = convKeyOverride ?? body.user ?? body.__sessionHeader ?? crypto.randomUUID();
   const msgs = [...(body.messages ?? [])];
   if (body.tools?.length && body.tool_choice !== "none") {
@@ -639,9 +674,10 @@ async function generateOne(body, onChunk, convKeyOverride) {
   if (body.response_format?.type === "json_object") {
     msgs.unshift({ role: "system", content: "Respond with a single valid JSON object only. No prose, no markdown fences." });
   }
-  return TRANSPORT === "acp"
-    ? acpChat(convKey, msgs, onChunk)
-    : runDevinPrint(flattenMessages(msgs)).then((text) => ({ text, usage: null }));
+  const r = TRANSPORT === "acp"
+    ? await acpChat(model, convKey, msgs, onChunk)
+    : await runDevinPrint(flattenMessages(msgs), model).then((text) => ({ text, usage: null }));
+  return { ...r, model };
 }
 
 // Non-streaming core, shared by the route and the batch processor.
@@ -662,7 +698,7 @@ async function runChatCompletion(body) {
     id: `chatcmpl-${crypto.randomBytes(12).toString("hex")}`,
     object: "chat.completion",
     created: Math.floor(Date.now() / 1000),
-    model: DEVIN_MODEL,
+    model: results[0]?.model ?? body.model ?? DEVIN_MODEL,
     choices: choices.map(({ _promptText, ...c }) => c),
     usage: {
       prompt_tokens: promptToks,
@@ -680,9 +716,9 @@ app.post("/v1/chat/completions", async (req, res) => {
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return openaiError(res, 400, "messages is required and must be a non-empty array");
   }
-  if (body.model && body.model !== DEVIN_MODEL) {
-    return openaiError(res, 404, `model '${body.model}' not found (shim serves '${DEVIN_MODEL}')`, "model_not_found");
-  }
+  const mv = await resolveModel(body.model);
+  if (mv.error) return openaiError(res, 404, mv.error, "model_not_found");
+  body.model = mv.model;
   normalizeLegacyTools(body);
   const n = Math.min(Math.max(body.n ?? 1, 1), 4); // cap: each choice = one agent run
 
@@ -696,7 +732,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       const created = Math.floor(Date.now() / 1000);
       const send = (delta, finish = null) =>
         res.write(`data: ${JSON.stringify({
-          id, object: "chat.completion.chunk", created, model: DEVIN_MODEL,
+          id, object: "chat.completion.chunk", created, model: body.model,
           choices: [{ index: 0, delta, finish_reason: finish }],
         })}\n\n`);
 
@@ -711,7 +747,7 @@ app.post("/v1/chat/completions", async (req, res) => {
       send({}, choice.finish_reason);
       if (body.stream_options?.include_usage) {
         res.write(`data: ${JSON.stringify({
-          id, object: "chat.completion.chunk", created, model: DEVIN_MODEL,
+          id, object: "chat.completion.chunk", created, model: body.model,
           choices: [], usage: realUsage(usage, estimateTokens(JSON.stringify(body.messages)), estimateTokens(text)),
         })}\n\n`);
       }
@@ -775,7 +811,7 @@ function buildResponse(id, text, body, usage, status = "completed") {
   const ot = usage?.outputTokens ?? estimateTokens(toolCall ? toolCall.function.arguments : clean);
   return {
     id, object: "response", created_at: Math.floor(Date.now() / 1000), status,
-    model: DEVIN_MODEL, output, output_text: clean,
+    model: body.model ?? DEVIN_MODEL, output, output_text: clean,
     usage: {
       input_tokens: it, output_tokens: ot, total_tokens: usage?.totalTokens ?? it + ot,
       ...(usage?.cachedReadTokens ? { input_tokens_details: { cached_tokens: usage.cachedReadTokens } } : {}),
@@ -796,6 +832,7 @@ function normalizeResponsesRequest(body, sessionHeader) {
     convKey = `resp:${body.user ?? sessionHeader ?? crypto.randomUUID()}`;
   }
   const normBody = {
+    model: body.model,
     messages: [
       ...(body.instructions ? [{ role: "system", content: body.instructions }] : []),
       ...responsesInputToMessages(body.input),
@@ -818,9 +855,9 @@ function normalizeResponsesRequest(body, sessionHeader) {
 
 app.post("/v1/responses", async (req, res) => {
   const body = req.body ?? {};
-  if (body.model && body.model !== DEVIN_MODEL) {
-    return openaiError(res, 404, `model '${body.model}' not found (shim serves '${DEVIN_MODEL}')`, "model_not_found");
-  }
+  const mv = await resolveModel(body.model);
+  if (mv.error) return openaiError(res, 404, mv.error, "model_not_found");
+  body.model = mv.model;
   if (body.input === undefined || body.input === null) {
     return openaiError(res, 400, "input is required");
   }
@@ -874,10 +911,27 @@ app.post("/v1/responses", async (req, res) => {
   }
 });
 
-app.get("/v1/models", (_req, res) => res.json({ object: "list", data: [MODEL] }));
-app.get("/v1/models/:id", (req, res) =>
-  req.params.id === DEVIN_MODEL ? res.json(MODEL) : openaiError(res, 404, "model not found"),
-);
+// Every catalog model is servable — each spawns its own acp process on first
+// request. Falls back to just DEVIN_MODEL when the catalog is unreachable.
+app.get("/v1/models", async (_req, res) => {
+  try {
+    const { data } = await getCatalog();
+    const models = [];
+    for (const fam of data.families ?? [])
+      for (const v of fam.variants ?? [])
+        models.push({ id: v.model_uid, object: "model", created: 0, owned_by: "cognition" });
+    res.json({ object: "list", data: models.length ? models : [MODEL] });
+  } catch {
+    res.json({ object: "list", data: [MODEL] });
+  }
+});
+app.get("/v1/models/:id", async (req, res) => {
+  if (req.params.id === DEVIN_MODEL) return res.json(MODEL);
+  const mv = await resolveModel(req.params.id);
+  mv.error
+    ? openaiError(res, 404, "model not found")
+    : res.json({ id: mv.model, object: "model", created: 0, owned_by: "cognition" });
+});
 
 // ---------------------------------------------------------------------------
 // Public model catalog: `devin models list --format json`, cached 5 min.
@@ -921,13 +975,20 @@ async function getCatalog() {
 app.get("/v1/catalog", async (req, res) => {
   try {
     const { data, stale } = await getCatalog();
+    // Free models are public metadata; anything that bills credits requires
+    // a shim API key. No key configured at all → open shim → everything is
+    // visible to everyone.
+    const authed = !API_KEYS.size || keyLabel(req) != null;
     const filter = String(req.query.filter ?? "all").toLowerCase(); // all|free|paid|recommended
+    if (!authed && filter === "paid")
+      return openaiError(res, 401, "paid model listing requires Authorization: Bearer <key>", "invalid_request_error");
     const tier = req.query.tier?.toLowerCase();                     // free|low|med|high
     const q = req.query.q?.toLowerCase();
     const models = [];
     for (const fam of data.families ?? []) {
       for (const v of fam.variants ?? []) {
         const free = /free/i.test(v.cost_tier ?? "");
+        if (!authed && !free) continue; // hide paid tiers from the public view
         const m = {
           model: v.model_uid,
           label: v.label,
@@ -942,7 +1003,8 @@ app.get("/v1/catalog", async (req, res) => {
           output_tokens: v.max_output_tokens ?? null,
           is_new: !!v.is_new,
           is_beta: !!v.is_beta,
-          served: v.model_uid === DEVIN_MODEL,
+          served: true, // any catalog model is servable — it gets its own acp process
+          default: v.model_uid === DEVIN_MODEL,
         };
         const t = (v.cost_tier ?? "").toLowerCase();
         if (filter === "free" && !free) continue;
@@ -956,6 +1018,7 @@ app.get("/v1/catalog", async (req, res) => {
     res.json({
       object: "list",
       served_model: DEVIN_MODEL,
+      authenticated: authed,          // false → free models only
       filters: { filter, tier: tier ?? null, q: q ?? null },
       stale,
       count: models.length,
@@ -1356,7 +1419,7 @@ async function startRun(t, body) {
         // New-thread run: full history; continuing run: only latest user turn
         ...(t.messagesSent ? [{ role: t.messages.at(-1).role === "assistant" ? "user" : t.messages.at(-1).role, content: t.messages.at(-1).text }] : t.messages.map((m) => ({ role: m.role, content: m.text }))),
       ];
-      const { text, usage } = await generateOne({ messages: msgs }, undefined, `thread:${t.id}`);
+      const { text, usage } = await generateOne({ messages: msgs, model: r.model }, undefined, `thread:${t.id}`);
       t.messagesSent = true;
       const reply = { id: `msg_${crypto.randomBytes(12).toString("hex")}`, created_at: Math.floor(Date.now() / 1000), thread_id: t.id, role: "assistant", text: applyPostHoc(text, {}), metadata: {} };
       t.messages.push(reply);

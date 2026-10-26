@@ -19,8 +19,9 @@ normalize to `tools`/`tool_choice` in both endpoints.
 
 ## How it works
 
-- Default transport is `devin acp` (`TRANSPORT=acp`): one long-lived JSON-RPC
-  process over newline-delimited stdio. Sessions persist per conversation key
+- Default transport is `devin acp` (`TRANSPORT=acp`): long-lived JSON-RPC
+  processes over newline-delimited stdio — **one per requested model**
+  (`acpFor(model)` pool, spawned lazily). Sessions persist per conversation key
   (OpenAI `user` field or `x-session-id` header) → real multi-turn, and
   `session/update` chunks → real SSE streaming.
 - Fallback transport `TRANSPORT=print` spawns `devin -p` per request
@@ -43,9 +44,13 @@ normalize to `tools`/`tool_choice` in both endpoints.
   `inputTokens`/`outputTokens`/`totalTokens`/`cachedReadTokens` (surfaced
   incl. `prompt_tokens_details.cached_tokens`); `print` falls back to
   estimates flagged `estimated: true`. Sampling params are no-ops.
-- Request `model` is validated: must equal `DEVIN_MODEL` or the shim returns
-  `404 model_not_found`. (The ACP process is spawned with `--model` once, so
-  per-request model switching isn't possible — no passthrough.)
+- Request `model` is validated against the account catalog (`devin models
+  list`, cached): any `model_uid` is servable — the first request for a
+  model lazily spawns a dedicated `devin acp --model <id>` process (the CLI
+  pins `--model` at spawn → process-per-model pool, sessions per process).
+  Unknown ids → `404 model_not_found`; `DEVIN_MODEL` is the default when
+  `model` is omitted and the only guaranteed-servable id if the catalog is
+  unreachable. `/v1/models` lists the whole catalog.
 - Multimodal input (acp only): `image_url` content parts → ACP `image` blocks
   (data: URLs decode directly; http(s) fetched shim-side, 15 s / 20 MB caps);
   `file` parts with text/* base64 inline as text. ACP `initialize` reports
@@ -136,13 +141,16 @@ point it at a repo unless you want "let's work on &lt;repo&gt;" greetings).
 
 ## Public catalog endpoint
 
-`GET /v1/catalog` is **exempt from `SHIM_API_KEY` auth** — it only exposes
-`devin models list --format json` metadata (cached 5 min, stale-served on
-CLI failure). Filters (composable): `?filter=all|free|paid|recommended`,
-`?tier=free|low|med|high`, `?q=<substr>`. `recommended` = free tier or the
-configured `DEVIN_MODEL`. Only `swe-2-{high,medium,max}` are `cost_tier:
-"Free"`; everything else bills credits. `served: true` marks the model the
-shim actually runs.
+`GET /v1/catalog` is **exempt from `SHIM_API_KEY` auth but key-aware** —
+no key → `cost_tier == "Free"` models only; valid Bearer → full catalog
+(`authenticated` field in the response says which view; `?filter=paid`
+unauthenticated → 401). Metadata from `devin models list --format json`
+(cached 5 min, stale-served on CLI failure). Filters (composable):
+`?filter=all|free|paid|recommended`, `?tier=free|low|med|high`,
+`?q=<substr>`. `recommended` = free tier or the configured `DEVIN_MODEL`.
+Only `swe-2-{high,medium,max}` are `cost_tier: "Free"`; everything else
+bills credits. `served: true` on all entries (every catalog model is
+servable via its own acp process); `default: true` marks `DEVIN_MODEL`.
 
 ## Token optimization
 
