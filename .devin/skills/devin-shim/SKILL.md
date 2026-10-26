@@ -1,0 +1,131 @@
+---
+name: devin-shim
+description: Run, test, and modify the OpenAI-compatible API shim over the Devin CLI. Use when working on server.js, the permission config, or endpoint behavior.
+---
+
+# devin-openai-shim
+
+Local OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`, `/health`)
+backed by the Devin CLI running respond-only on SWE-2.
+
+## How it works
+
+- Default transport is `devin acp` (`TRANSPORT=acp`): one long-lived JSON-RPC
+  process over newline-delimited stdio. Sessions persist per conversation key
+  (OpenAI `user` field or `x-session-id` header) → real multi-turn, and
+  `session/update` chunks → real SSE streaming.
+- Fallback transport `TRANSPORT=print` spawns `devin -p` per request
+  (stateless, single-chunk stream, history flattened into the prompt).
+- `devin-readonly.json` is passed via `--config` and **hard-denies** `exec`,
+  `edit`, `Write(**)`, `Fetch(*)`, and `mcp__*`. Additionally the ACP layer
+  refuses every agent→client request (`fs/*`, `terminal/*`,
+  `session/request_permission` → cancelled). Respond-only is enforced twice —
+  do not weaken either layer.
+- Emulations to know before debugging: `tools` are prompt-injected and parsed
+  from a `{"tool_call":{...}}` reply; `stop`/`max_tokens` truncate post-hoc;
+  `usage` is estimated (~4 chars/token); sampling params are no-ops.
+- Request `model` is validated: must equal `DEVIN_MODEL` or the shim returns
+  `404 model_not_found`. (The ACP process is spawned with `--model` once, so
+  per-request model switching isn't possible — no passthrough.)
+
+## Run / test
+
+```bash
+npm install
+npm start                                # http://127.0.0.1:8787
+K=5137ffcfd7d937840e479851382c3de9e443b89b7f503c52   # SHIM_API_KEY from .env
+curl http://127.0.0.1:8787/health -H "Authorization: Bearer $K"   # smoke test
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer $K" -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"hello"}]}'
+```
+
+When `SHIM_API_KEY` is set it guards **every** route including `/health` —
+requests without `Authorization: Bearer` get 401.
+
+Requires `devin auth login` to have been run once — browser flow, the user
+must do it (it reuses their existing Devin browser session; typically one
+click, no password re-entry). The login menu is interactive — it needs a
+real TTY, so on Windows an agent shell **cannot** drive it; the user must
+run it in their own terminal (CMD/PowerShell: `& "<bundled path>" auth login`). **Devin Desktop sign-in does NOT satisfy
+this** — Desktop and CLI keep separate credential stores. If
+`devin auth status` says "Not logged in", nothing else will work. If
+`devin` isn't on PATH on Windows, the bundled binary lives at
+`%LOCALAPPDATA%\Programs\Devin\resources\app\extensions\windsurf\devin\bin\devin.exe`.
+
+## Platform notes
+
+- **Windows**: `server.js` defaults `DEVIN_BIN` to the CLI bundled in Devin
+  Desktop. Credentials at `%APPDATA%\devin\credentials.toml`; user config at
+  `%APPDATA%\devin\config.json`.
+- **macOS/Linux**: `DEVIN_BIN` defaults to `devin` on PATH (standalone
+  installer). Credentials at `~/.config/devin/credentials.toml`; user config
+  at `~/.config/devin/config.json`.
+- Node 18+ on both. Everything else is platform-neutral.
+
+## Env vars
+
+`DEVIN_MODEL` (default `swe-2-high`), `TRANSPORT` (`acp`|`print`), `PORT`,
+`HOST`, `SHIM_API_KEY`, `MAX_CONCURRENT` (print only), `DEVIN_TIMEOUT_MS`,
+`SESSION_TTL_MS`, `DEVIN_BIN`.
+
+## Public catalog endpoint
+
+`GET /v1/catalog` is **exempt from `SHIM_API_KEY` auth** — it only exposes
+`devin models list --format json` metadata (cached 5 min, stale-served on
+CLI failure). Filters (composable): `?filter=all|free|paid|recommended`,
+`?tier=free|low|med|high`, `?q=<substr>`. `recommended` = free tier or the
+configured `DEVIN_MODEL`. Only `swe-2-{high,medium,max}` are `cost_tier:
+"Free"`; everything else bills credits. `served: true` marks the model the
+shim actually runs.
+
+## Verified clients
+
+Confirmed working end-to-end (chat + SSE streaming, 2026-10-26):
+
+- **Directus 11** "OpenAI Compatible Provider":
+  Base URL `http://127.0.0.1:8787/v1`, API Key = `SHIM_API_KEY` from `.env`,
+  no custom headers, model `swe-2-high` (only ID the shim serves).
+  If Directus runs in Docker use `http://host.docker.internal:8787/v1` —
+  `127.0.0.1` inside a container doesn't reach the host.
+- **curl** non-streaming and `stream:true` requests (see Run/test above).
+
+## Reference documentation
+
+For anything about the CLI itself — flags, permission-rule syntax, model IDs,
+auth flows, sandbox behavior — **invoke the built-in `devin-cli` skill**. It
+resolves the official bundled docs directory per platform automatically;
+do not hardcode docs paths in this repo (they differ between the Windows
+Devin Desktop bundle and the standalone macOS/Linux install).
+
+Canonical topics and where they live in those docs:
+
+- Permission syntax (`Exec`, `Read`, `Write`, `Fetch`, `mcp__*`, tool names):
+  `reference/permissions.mdx`
+- Global flags (`-p`, `--model`, `--config`, `--respect-workspace-trust`):
+  `reference/commands.mdx`
+- Config file format (`permissions`, `agent.model`): `reference/configuration/config-file.mdx`
+- Model selection: `models.mdx`; auth: `enterprise/devin-auth.mdx`
+
+## Gotchas
+
+- `devin auth status` must show logged in before endpoints will respond.
+- **`ACP_BACKEND` env var:** when set (always true inside Devin Desktop
+  sessions/terminals), the CLI ignores `credentials.toml` and every command —
+  including `auth status` — reports "Not logged in". `server.js` strips it from
+  spawned children (`CHILD_ENV`); strip it too when checking auth from a
+  Desktop shell: `env -u ACP_BACKEND devin auth status`.
+- **`devin acp` does not accept `--config`** (only `--model`, `--agent-type`,
+  `--refusal-fallback`). `--config` is a global flag and must precede the
+  subcommand: `devin --config devin-readonly.json acp --model ...`.
+- ACP sessions are per-process: if `devin acp` exits, the shim recreates the
+  session on next prompt and replays the flattened history once.
+- ACP reference (method names, `session/update` chunk shape):
+  https://agentclientprotocol.com — JSON-RPC 2.0, newline-delimited frames.
+- In `print` mode, a permission prompt can't render — anything not
+  auto-approved or denied may hang until `DEVIN_TIMEOUT_MS`. Keep the deny
+  list complete.
+- Verify the model ID with `devin models list --format json`.
+- Restarting: killing the npm shell leaves `node server.js` alive holding
+  port 8787 (`EADDRINUSE` on next start). Kill it by PID:
+  `netstat -ano | findstr :8787` → `taskkill /PID <pid> /F`.
