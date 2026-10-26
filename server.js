@@ -305,12 +305,11 @@ class AcpClient {
         terminal: false,
       },
       clientInfo: { name: "devin-openai-shim", version: "0.2.0" },
-    }).then(async (res) => {
-      // If the agent demands auth, take the first offered method.
-      const method = res?.authMethods?.[0];
-      if (method?.id) await this.request("authenticate", { methodId: method.id });
-      return res;
     });
+    // NOTE: never proactively call `authenticate` — the agent advertises
+    // browser PKCE methods even when stored credentials satisfy auth, and a
+    // headless browser flow hangs forever, blocking every request. If the
+    // backend genuinely needs auth, session/new fails and we surface it.
     return this.ready;
   }
 
@@ -367,8 +366,13 @@ class AcpClient {
 
   async newSession() {
     await this.ensureStarted();
-    const res = await this.request("session/new", { cwd: __dirname, mcpServers: [] });
-    return res.sessionId;
+    try {
+      const res = await this.request("session/new", { cwd: __dirname, mcpServers: [] });
+      return res.sessionId;
+    } catch (e) {
+      if (/auth/i.test(e.message)) throw new Error(`${e.message} — run \`devin auth login\``);
+      throw e;
+    }
   }
 
   // Prompt with ACP content blocks [{type:"text"|"image",...}]. Resolves to the

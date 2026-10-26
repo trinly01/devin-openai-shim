@@ -173,6 +173,12 @@ Canonical topics and where they live in those docs:
   including `auth status` — reports "Not logged in". `server.js` strips it from
   spawned children (`CHILD_ENV`); strip it too when checking auth from a
   Desktop shell: `env -u ACP_BACKEND devin auth status`.
+- **Never call `authenticate` proactively.** `initialize` may advertise
+  `authMethods` (e.g. `devin-browser`) even when stored credentials are
+  already valid — calling it launches a browser PKCE flow inside a headless
+  spawned process that never completes, blocking `ready` and hanging EVERY
+  request until the timeout. Just attempt `session/new`; if it fails with an
+  auth error, surface `devin auth login` as the remedy.
 - **`devin acp` does not accept `--config`** (only `--model`, `--agent-type`,
   `--refusal-fallback`). `--config` is a global flag and must precede the
   subcommand: `devin --config devin-readonly.json acp --model ...`.
