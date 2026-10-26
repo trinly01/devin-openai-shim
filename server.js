@@ -20,14 +20,19 @@ const READONLY_CONFIG = path.join(__dirname, "devin-readonly.json");
 const TRANSPORT = process.env.TRANSPORT ?? "acp"; // "acp" | "print"
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST ?? "127.0.0.1";
-// SHIM_API_KEY accepts one or more keys, comma-separated. Each entry may be
+// SHIM_API_KEY accepts one or more keys, comma-separated; each entry may be
 // "name:key" (name becomes the access-log identity) or a bare "key" (identity
-// = first 6 chars). Keys are never logged.
+// = first 6 chars). Alternatively, one key per env line via
+// SHIM_API_KEY_<NAME>=<secret>. Both forms combine. Keys are never logged.
 const API_KEYS = new Map(); // secret -> label
 for (const e of (process.env.SHIM_API_KEY ?? "").split(",").map((s) => s.trim()).filter(Boolean)) {
   const i = e.indexOf(":");
   if (i > 0) API_KEYS.set(e.slice(i + 1), e.slice(0, i));
   else API_KEYS.set(e, `key:${e.slice(0, 6)}…`);
+}
+for (const [k, v] of Object.entries(process.env)) {
+  const m = /^SHIM_API_KEY_([A-Za-z0-9_-]+)$/.exec(k);
+  if (m && v.trim()) API_KEYS.set(v.trim(), m[1].toLowerCase());
 }
 const API_KEY = API_KEYS.size ? "set" : null; // truthy gate; real keys live in the map
 const TIMEOUT_MS = Number(process.env.DEVIN_TIMEOUT_MS ?? 8 * 60 * 1000);
